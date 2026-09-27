@@ -49,6 +49,11 @@ check() {
   if [ -n "${2:-}" ]; then has "$name" "$2" || { ok=0; detail="${detail} missing: $2"; }; fi
   if [ -n "${3:-}" ]; then has "$name" "$3" && { ok=0; detail="${detail} should not contain: $3"; }; fi
   if [ -n "${4:-}" ]; then [ "$(nmatch "$name" "$4")" -ge 2 ] || { ok=0; detail="${detail} expected >=2 of: $4"; }; fi
+  # Optional 5th/6th args: regex that must match exactly N times (N defaults 1).
+  if [ -n "${5:-}" ]; then
+    c=$(grep -cE -- "$5" "/tmp/t-$name.txt" 2>/dev/null); c=${c:-0}
+    [ "$c" -eq "${6:-1}" ] || { ok=0; detail="${detail} expected exactly ${6:-1} of: $5 (got $c)"; }
+  fi
   if [ "$ok" = 0 ]; then note "      --- dump ---"; sed 's/^/        /' "/tmp/t-$name.txt" 2>/dev/null; fi
   record "$name" "$ok" "$detail"
 }
@@ -77,6 +82,35 @@ for f in test/scenarios/t-*.vim; do
   [ -n "$only" ] && [ "$only" != "$name" ] && continue
   case "$name" in
     abort)    export FAKE_PI_THINKING= FAKE_PI_TOOL=;     run abort 4;   check abort 'abort requested' '' '' ;;
+    abortresume) export FAKE_PI_THINKING= FAKE_PI_TOOL= FAKE_PI_DELAY_MS=800 FAKE_PI_TURN_MS=1200
+                 run abortresume 10
+                 check abortresume 'abort requested' '' ''
+                 # the post-abort prompt (sent through the normal CR path) must
+                 # still reach the agent and get a reply
+                 check abortresume 'Echo: second prompt' '' ''
+                 export FAKE_PI_DELAY_MS=300 FAKE_PI_TURN_MS=60 ;;
+    abortreplay)
+                 # replay of a captured REAL pi session: in-flight tool, abort
+                 # mid-tool (real event flood), then a follow-up prompt
+                 export PATH="$PWD/test/replay/bin:$PATH"
+                 run abortreplay 14
+                 export PATH="$PWD/test:$PATH"
+                 check abortreplay 'abort requested' '' ''
+                 check abortreplay '^OK$' '' '' ;;
+    abortdeath)
+                 # pi dies right after the abort burst (stale-ctx style
+                 # extension crash); the panel must be recoverable with
+                 # :PiOpen and a later send must reach the new process
+                 rm -f /tmp/t-abortdeath-state
+                 export REPLAY_DIE_AFTER_ABORT=1 REPLAY_STATE=/tmp/t-abortdeath-state
+                 export PATH="$PWD/test/replay/bin:$PATH"
+                 run abortdeath 16
+                 export REPLAY_DIE_AFTER_ABORT= REPLAY_STATE=
+                 export PATH="$PWD/test:$PATH"
+                 # the dead-agent warning appears exactly once and no stuck
+                 # "pi is working" spinner line may remain in the buffer
+                 check abortdeath 'agent process is not running' '⏳ pi is working' '' 'agent process is not running' 1
+                 check abortdeath '^OK$' '' '' ;;
     close)    export FAKE_PI_THINKING= FAKE_PI_TOOL=;     run close 4
               check close 'wins:1' '' ''
               check close 'bufwinnr:-1' '' '' ;;
@@ -126,14 +160,44 @@ and then acting"
               # sample fully-ok, forbid absent/mismatch/item-missing, want >=2 ok).
               # Headless: synID rendering is a no-op, but :hi + :syntax list are
               # observable; the item check catches syn lines that silently fail.
-              check markdown 'PiMdHeading: ok' 'absent\|mismatch\|item-missing' ': ok' ;;
+              # 'render-ok' (nested vim -es per-byte dump) proves **text** resolves
+              # to bold, not italic; the forbid list also catches the render
+              # failure strings (which the plain ': ok' min-two would not).
+              check markdown 'PiMdHeading: ok' 'absent\|mismatch\|item-missing\|render-harness\|render-bold\|render-italic' ': ok' 'render-ok' '1' ;;
     working)  export FAKE_PI_DELAY_MS=2500 FAKE_PI_TURN_MS=100 FAKE_PI_THINKING= FAKE_PI_TOOL=
               run working 7
               # in flight: working line shown, reply not yet; after settle: reply in, working gone.
               check working-mid 'pi is working' 'Echo:' ''
               check working 'Echo: hello fake' 'pi is working' ''
               export FAKE_PI_DELAY_MS= ;;
-    clear)    export FAKE_PI_THINKING= FAKE_PI_TOOL=;     run clear 11;  check clear 'Echo: second' 'Echo: first' '' ;;
+    clear)    export FAKE_PI_THINKING=1 FAKE_PI_TOOL= FAKE_PI_ARGV_LOG=/tmp/t-clear-argv.log
+              : > /tmp/t-clear-argv.log
+              run clear 13
+              # The seeded pre-clear session file must be deleted by :PiClear,
+              # so a later :PiOpen (even after a vim restart) resumes the
+              # post-clear session instead of the pre-clear one.
+              check clear 'Echo: second' 'Echo: first' '' 'cleared-old: 1'
+              # :PiClear must also wipe the thinking panel: only the second
+              # turn's marker may remain, the first turn's must be gone.  (grep
+              # the scenario's dump directly: check() would look for a file
+              # named after this check.)
+              if grep -qE -- '──── second question' /tmp/t-clear.txt && ! grep -qE -- '──── first question' /tmp/t-clear.txt; then
+                record clear-think 1 ''
+              else
+                record clear-think 0 'thinking panel not cleared (first turn lingered or second turn missing)'
+              fi
+              # :PiClear must restart the process rather than send an in-process
+              # `new_session` (session replacement leaves pi-observational-memory
+              # holding a stale ctx; it then throws on the next settled turn and
+              # exits the agent with code 1).  The restart reuses the stable
+              # context-keyed id (the pre-clear file is deleted first, so
+              # create-or-resume starts a fresh session), so both launches must
+              # carry the same --session-id.
+              if node -e 'const fs=require("fs");const l=fs.readFileSync("/tmp/t-clear-argv.log","utf8").trim().split("\n").filter(Boolean).map(s=>JSON.parse(s));const id=a=>{const i=a.indexOf("--session-id");return i<0?null:a[i+1];};if(l.length!==2)throw new Error("expected 2 launches, got "+l.length);if(!id(l[0])||!id(l[1]))throw new Error("missing --session-id in launch");if(id(l[0])!==id(l[1]))throw new Error("PiClear restart must keep the context-keyed session id");' 2>/dev/null
+              then record clear-restart 1
+              else record clear-restart 0 "restart with context-keyed --session-id not observed"
+              fi
+              export FAKE_PI_ARGV_LOG= ;;
     pifile)   export FAKE_PI_THINKING= FAKE_PI_TOOL=;     run pifile 6;  check pifile 'context file: .*t-pifile-ctx' '' '' ;;
     notify)   export FAKE_PI_THINKING= FAKE_PI_TOOL= FAKE_PI_NOTIFY_ALL=1
               run notify 4
@@ -170,6 +234,24 @@ the options, carefully"
               check resumethink 'panel-thought-2: 1' '' ''
               check resumethink 'panel-marker-1: 1' '' ''
               check resumethink 'panel-marker-2: 1' '' '' ;;
+    panelguard) export FAKE_PI_THINKING= FAKE_PI_TOOL= FAKE_PI_LOG=/tmp/fakepi-panelguard.log
+      : > /tmp/fakepi-panelguard.log
+      run panelguard 7
+      check panelguard 'panel-ok: current window shows the chat buffer'
+      check panelguard 'filewindow-ok:'
+      check panelguard 'I switched the file I am working on to: /tmp/panel-b\.txt'
+      check panelguard 'context file switched: /tmp/panel-b\.txt'
+      export FAKE_PI_LOG= ;;
+
+    trackfile) export FAKE_PI_THINKING= FAKE_PI_TOOL= FAKE_PI_LOG=/tmp/fakepi-trackfile.log
+              : > /tmp/fakepi-trackfile.log
+              run trackfile 6
+              # two distinct switches -> exactly two switch prompts (re-editing
+              # the same buffer is a no-op), and the log line for the second one
+              check trackfile 'I switched the file I am working on to: /tmp/t-trackfile-a\.txt' \
+                '' '' '"message":"I switched the file I am working on to:' 2
+              check trackfile 'context file switched: /tmp/t-trackfile-b\.txt'
+              export FAKE_PI_LOG= ;;
     *)        export FAKE_PI_THINKING= FAKE_PI_TOOL=;     run "$name" 10; check "$name" '' '' '' ;;
   esac
 done

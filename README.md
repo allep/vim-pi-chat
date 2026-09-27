@@ -66,7 +66,7 @@ Requirements:
 | `:PiSend <text>` | send a prompt (no text: jump to the chat and start typing) |
 | `:PiAbort` | abort the current run (`{"type":"abort"}`) |
 | `:PiModel <pattern>` | switch model, e.g. `:PiModel anthropic/claude-sonnet-4-5` |
-| `:PiClear` | start a fresh session (`new_session`) |
+| `:PiClear` | start a fresh session (restarting the agent process with a new session id, so extensions never see a replaced session) |
 | `:PiThinking` | toggle a small read-only panel below the chat (opened automatically with `:PiOpen`) streaming the model's thinking live, auto-scrolled to the newest line (height: `g:pi_chat_thinking_height`). Thoughts accumulate even while hidden, under a `──── prompt` marker per turn, so opening it later shows past thinking; `:PiClear` / `:PiClose` wipe it |
 | `:PiClose` | stop the agent and close (tear down) the chat |
 | `:PiFile [path]` | show or set the context file (see below) |
@@ -85,6 +85,12 @@ and it being the last window on the buffer) just parks the agent — the
 transcript and your half-typed prompt survive. Reopening with `:PiOpen` or
 `:buffer __PiChat__` resumes the same conversation. `:PiClose` is the one that
 actually tears the session down.
+
+The panels also defend their own windows. If you run a buffer-switching
+command (`:e file`, `:b`, `:bn`, …) while the cursor is on the chat or
+thinking panel, the file is moved into your last real-file window and the
+panel is restored in place, so a stray `:e` can never replace a panel. With
+no file window open the file stays put and `:PiOpen` brings the panel back.
 
 Sessions persist the usual way — pi stores them in `~/.pi/sessions` and
 resumes by default; each `:PiOpen` continues the most recent session. Use
@@ -113,6 +119,12 @@ When pi edits the context file (via its edit/write tool) the plugin reloads the
 buffer from disk so you see the change live. If that buffer has unsaved changes
 of your own, the reload is skipped with a notification and a `:e!` hint,
 so it never clobbers your in-progress edits.
+
+With `g:pi_chat_track_files` (default `1`) the context also follows your
+working file automatically: opening a different real file (`:e`, `:b`, …)
+re-keys it, and if the agent is running it is told the switch (logged in the
+chat); with it parked, the new file is used on the next `:PiOpen`. Set
+`g:pi_chat_track_files = 0` to keep the context fixed until you use `:PiFile`.
 
 ### Resuming a conversation
 
@@ -143,8 +155,10 @@ let g:pi_chat_no_session = 0            " 1 = pass --no-session
 let g:pi_chat_streaming_behavior = 'followUp'  " 'followUp' (default) or 'steer'
 let g:pi_chat_show_thinking = 0         " 1 = also render thinking deltas inline in the chat
 let g:pi_chat_thinking_height = 0.3     " :PiThinking panel height: float 0-1 of the window, or lines
+let g:pi_chat_markdown = 1              " 0 = disable the built-in markdown highlighting in the chat/thinking buffers
 let g:pi_chat_map = '<leader>pi'        " '' disables the global mapping
 let g:pi_chat_context_file = 1          " 1 = inject the context file into prompts
+let g:pi_chat_track_files = 1           " 1 = re-key pi's context when you switch files (:e, :b, …)
 let g:pi_chat_autosave_context = 0      " 1 = save the context file before each send (else prompt)
 let g:pi_chat_run_timeout = 300         " 0 = off; N = warn if a run is still busy after N seconds
 let g:pi_chat_session_resume = 1        " 1 = :PiOpen resumes the file's (or folder's) pi conversation
@@ -156,6 +170,12 @@ let g:pi_chat_resume_max_messages = 50  " 0 = show the whole prior transcript; N
 `g:pi_chat_streaming_behavior` only matters when you send a prompt while the
 agent is already running: `followUp` queues it until the run fully settles,
 `steer` injects it after the current tool calls finish.
+
+The chat and thinking panels render markdown with the plugin's own
+buffer-local Vim highlighting (`g:pi_chat_markdown`, on by default):
+headings, bold/italic, inline and fenced code, lists, quotes and links, all
+layered on as the buffer streams in. Set `g:pi_chat_markdown = 0` to turn
+it off.
 
 `g:pi_chat_autosave_context` controls what happens when you send a prompt with
 unsaved changes in the context file: `1` saves it to disk first (so pi edits
@@ -182,12 +202,21 @@ are shown on resume (`0` = the whole transcript, handy for a long-running file).
 - Extension `editor` requests open a temporary scratch buffer (`:w` saves,
   `:q!` cancels).
 
+If the agent process dies (crash, an extension exiting, `:PiClose`), the
+panel recovers: sending to a dead agent logs `⚠ agent process is not
+running (use :PiOpen)` and clears the working state instead of wedging the
+input, and `:PiOpen` restarts the agent (resuming the session for the same
+file). `:PiClear` always forces a brand-new session.
+
 ## Development
 
 Run the whole end-to-end suite (the basic E2E plus the scenarios in
-`test/scenarios/`: `abort`, `clear`, `close`, `fail`, `model`, `multi`,
-`nosession`, `notify`, `pifile`, `pifilecmd`, `pisend`, `resume`, `think`,
-`thinkoff`, `thinkpanel`, `tools`, `working`) from the repo root. The `stall` watchdog scenario is
+`test/scenarios/`: `abort`, `abortreplay`, `abortresume`, `abortdeath`,
+`clear`, `close`, `fail`, `markdown`, `model`, `multi`, `nosession`,
+`notify`, `panelguard`, `pifile`, `pifilecmd`, `pisend`, `resume`, `think`,
+`thinkoff`, `thinkpanel`, `tools`, `trackfile`, `working`) from the repo root.
+The `abortreplay` scenario replays a captured real-pi session byte-for-byte
+(`test/replay/`). The `stall` watchdog scenario is
 manual-only (a slow fake triggers a headless hit-enter barrier):
 
 ```sh

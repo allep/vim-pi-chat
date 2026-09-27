@@ -50,6 +50,7 @@ set cpo&vim
 "   g:pi_chat_show_thinking        1 = render thinking deltas
 "   g:pi_chat_map                  global normal-mode mapping, default <leader>pi
 "   g:pi_chat_context_file         1 = inject the context file into prompts
+"   g:pi_chat_track_files          1 = tell pi when you switch files (:e, :b)
 "
 " Protocol reference: pi docs/rpc.md
 " ---------------------------------------------------------------------------
@@ -83,6 +84,7 @@ if !exists('g:pi_chat_streaming_behavior')   | let g:pi_chat_streaming_behavior 
 if !exists('g:pi_chat_show_thinking')        | let g:pi_chat_show_thinking = 0 | endif
 if !exists('g:pi_chat_map')                  | let g:pi_chat_map = '<leader>pi' | endif
 if !exists('g:pi_chat_context_file')         | let g:pi_chat_context_file = 1 | endif
+if !exists('g:pi_chat_track_files')          | let g:pi_chat_track_files = 1 | endif
 if !exists('g:pi_chat_autosave_context')     | let g:pi_chat_autosave_context = 0 | endif
 " Auto-resume a pi session keyed to the file you opened (then its folder):
 " the file/folder -> session association is implicit, via a stable id derived
@@ -107,6 +109,11 @@ let s:bufname = '__PiChat__'
 " prompts so the agent knows which document to read/edit (and used as the pi
 " job's cwd).
 let s:context_file = ''
+let s:context_buf = -1
+" window bookkeeping for s:PanelGuard(): winid of the last window showing a
+" real file, and winid -> panel bufnr for windows currently showing one.
+let s:file_win = 0
+let s:panel_wins = {}
 " The pi session id in use for the current job ('' = none / pi default), and
 " the resume kind chosen at start ('file', 'dir' or 'new') for the log hint.
 let s:session_id = ''
@@ -128,11 +135,6 @@ let s:think_buf = -1       " bufnr of the thinking panel buffer, or -1
 let s:think_text = ''      " full thinking text for the current turn
 " Buffers already given buffer-local markdown highlighting (avoid dupes).
 let s:md_done = {}
-" Optional glow(1) preview for the thinking panel: window id + temp file.
-let s:think_glow_win = -1
-let s:think_glow_tmp = ''
-let s:think_glow_width = 80
-
 " Buffer invariants:
 "   lines 1 .. len(s:transcript) are the read-only log and must always match
 "   s:transcript byte-for-byte. The input block occupies every line from
@@ -156,6 +158,9 @@ let s:req_id = 0
 let s:pending_msg = ''
 " 1 = about to create a brand-new session, 0 = resuming a parked one.
 let s:fresh = 1
+" Set by :PiClear: the next s:StartJob must launch a brand-new session even
+" though the context already maps to an existing (pre-clear) session file.
+let s:clear_new_session = 0
 
 " Busy indicator: an animated spinner in the chat buffer's statusline runs
 " from the moment a prompt is sent until the turn settles, so the user can
@@ -210,6 +215,11 @@ function! s:PiOpen(...)
   " Fresh session: capture the buffer the user was viewing before the chat
   " window took over.
   let s:context_file = expand('%:p')
+  " Only pin a buffer number when the context is actually a named file
+  " buffer: an unnamed buffer can later be named by :e file, and virtual
+  " buffers are never context files.
+  let s:context_buf = (empty(bufname('%'))
+        \ || !empty(getbufvar('%', '&buftype')) ? -1 : bufnr('%'))
   let s:fresh = 1
   call s:StartJob()
 
@@ -639,7 +649,7 @@ endfunction
 
 " Called with the panel buffer current (right after `:buffer`).
 function! s:ThinkBufInit()
-  setlocal buftype=nofile bufhidden=hide noswapfile nonumber norelativenumber
+  setlocal buftype=nofile bufhidden=hide noswapfile nonumber norelativenumber nospell
   setlocal wrap linebreak foldcolumn=0
   " `let &l:statusline` is the only form that sticks for values containing
   " spaces in this vim: `:setlocal statusline='… …'` raises E518 (value split
@@ -721,28 +731,26 @@ endfunction
 " and redraw is deferred until this flush returns, so the hop never steals
 " focus.
 function! s:FlushThinkTail()
-  if s:think_buf < 0 || empty(s:think_text)
+  if empty(s:think_text)
     return
   endif
-  let l:parts = split(s:think_text, "\n", 1)
-  let l:render = l:parts[:-2]  " complete lines
-  if l:parts[-1] !=# ''
-    call add(l:render, l:parts[-1])
-  endif
-  let l:old = getbufline(s:think_buf, 1, '$')
-  if l:render == l:old
-    return
-  endif
-  call s:ThinkBufWrite({ -> s:ThinkBufSync(l:render) })
-  let l:win = bufwinid(s:think_buf)
-  if l:win > 0
-    let l:here = win_getid()
-    call win_gotoid(l:win)
-    call cursor(len(l:render), 1)
-    call win_gotoid(l:here)
-  endif
-  if s:think_glow_win > 0
-    call s:ThinkGlowRender()
+  if s:think_buf >= 0
+    let l:parts = split(s:think_text, "\n", 1)
+    let l:render = l:parts[:-2]  " complete lines
+    if l:parts[-1] !=# ''
+      call add(l:render, l:parts[-1])
+    endif
+    let l:old = getbufline(s:think_buf, 1, '$')
+    if l:render != l:old
+      call s:ThinkBufWrite({ -> s:ThinkBufSync(l:render) })
+      let l:win = bufwinid(s:think_buf)
+      if l:win > 0
+        let l:here = win_getid()
+        call win_gotoid(l:win)
+        call cursor(len(l:render), 1)
+        call win_gotoid(l:here)
+      endif
+    endif
   endif
 endfunction
 
@@ -779,8 +787,11 @@ function! s:ApplyMarkdown()
   syn match PiMdFence     '^\s*```\S*'
   syn region PiMdCodeBlock start=/^\s*```/ end=/^\s*```/ contains=PiMdFence keepend
   syn match PiMdHeading   '^#\+\s\+\S.*\|^#\+\s*$'
-  syn match PiMdBold      '\*\*\S.*\S\*\*'
+  " PiMdItalic must be defined BEFORE PiMdBold: when both match the same
+  " bytes (the inner *text* of **text**), the last-defined item wins per
+  " byte, so defining bold last keeps **text** bold instead of italic.
   syn match PiMdItalic    '\*\S[^*]*\S\*\|\*\S[^*]*$'
+  syn match PiMdBold      '\*\*\S.*\S\*\*'
   syn match PiMdCode      '`[^`]\+`'
   syn match PiMdList      '^\s*[-*+]\s\|^\s*[0-9]\+\.\s'
   syn match PiMdQuote     '^>.*'
@@ -796,92 +807,8 @@ function! s:ApplyMarkdown()
   hi def link PiMdLink      Underlined
 endfunction
 
-" -------------------- optional glow(1) markdown preview ---------------------
-
-function! s:GlowAvailable()
-  return get(g:, 'pi_chat_thinking_glow', 0) && has('terminal') && executable('glow')
-endfunction
-
-function! s:ThinkGlowOpen()
-  if s:think_glow_win > 0
-    return
-  endif
-  let s:think_glow_tmp = tempname() . '.md'
-  call writefile(split(s:think_text, "\n", 1), s:think_glow_tmp)
-  let l:here = win_getid()
-  botright vertical split
-  let s:think_glow_width = (winwidth(0) / 2) - 4
-  if s:think_glow_width < 40
-    let s:think_glow_width = 40
-  endif
-  execute 'vertical resize ' . s:think_glow_width
-  terminal
-  let s:think_glow_win = win_getid()
-  call s:ThinkGlowRender()
-  call win_gotoid(l:here)
-endfunction
-
-" Re-run glow on the temp file (a persistent shell terminal, driven by keys).
-function! s:ThinkGlowRender()
-  if s:think_glow_win < 0 || empty(s:think_text)
-    return
-  endif
-  call writefile(split(s:think_text, "\n", 1), s:think_glow_tmp)
-  let l:buf = winbufnr(s:think_glow_win)
-  if l:buf > 0 && bufvalid(l:buf)
-    try
-      call term_sendkeys(l:buf, 'clear; glow -w ' . s:think_glow_width . ' ' . fnameescape(s:think_glow_tmp) . "\<CR>")
-    catch
-    endtry
-  endif
-endfunction
-
-function! s:ThinkGlowClose()
-  if s:think_glow_win > 0
-    let l:here = win_getid()
-    if win_gotoid(s:think_glow_win)
-      close
-    endif
-    call win_gotoid(l:here)
-    let s:think_glow_win = -1
-  endif
-  if !empty(s:think_glow_tmp) && filereadable(s:think_glow_tmp)
-    delete(s:think_glow_tmp)
-    let s:think_glow_tmp = ''
-  endif
-endfunction
-
-" :PiMarkdown — open a glow(1) preview of the chat buffer in a split.
-function! s:PiMarkdown()
-  if !has('terminal') || !executable('glow')
-    echo 'pi chat: glow not found (brew install glow) and +terminal required'
-    return
-  endif
-  if s:buf < 1
-    echo 'pi chat: no chat to preview'
-    return
-  endif
-  let l:tmp = tempname() . '.md'
-  call writefile(getbufline(s:buf, 1, '$'), l:tmp)
-  let l:here = win_getid()
-  botright vertical split
-  let l:w = (winwidth(0) / 2) - 4
-  if l:w < 40
-    let l:w = 40
-  endif
-  execute 'vertical resize ' . l:w
-  terminal
-  call term_sendkeys(winbufnr(0), 'clear; glow -w ' . l:w . ' ' . fnameescape(l:tmp) . "\<CR>")
-  call win_gotoid(l:here)
-endfunction
-command! -nargs=0 PiMarkdown call s:PiMarkdown()
-
-" :PiOpen opens both panels: show the thinking view (text panel or glow
-" preview) if it isn't already open.
+" :PiOpen opens both panels: show the thinking view if it isn't already open.
 function! s:PiShowThinking()
-  if s:think_glow_win > 0
-    return
-  endif
   if s:think_buf > 0 && bufwinnr(s:think_buf) != -1
     return
   endif
@@ -889,16 +816,6 @@ function! s:PiShowThinking()
 endfunction
 
 function! s:PiThinking()
-  " Optional glow(1) preview: drive a live terminal instead of the text panel.
-  if s:GlowAvailable()
-    if s:think_glow_win > 0
-      call s:ThinkGlowClose()
-      echo 'pi chat: thinking preview hidden (content kept)'
-    else
-      call s:ThinkGlowOpen()
-    endif
-    return
-  endif
   if s:think_buf > 0 && bufwinnr(s:think_buf) != -1
     " toggle off: the window closes, the buffer (and its content) survives
     call win_gotoid(bufwinid(s:think_buf))
@@ -967,6 +884,17 @@ if !empty(g:pi_chat_map) && maparg(g:pi_chat_map, 'n') ==# ''
   execute printf('nnoremap <silent> %s :PiOpen<CR>', g:pi_chat_map)
 endif
 
+" Track the user switching to a different file (:e, :b, tab switching to a
+" file buffer, ...): keep the context file in sync and tell pi about it, so
+" the agent's next turn works on the file the user is actually looking at.
+augroup PiChatFileTrack
+  autocmd!
+  " PanelGuard first: the panel must be back in its window before OnFileEnter
+  " logs the switch (the log is appended to the chat window's buffer).
+  autocmd BufEnter * call s:PanelGuard()
+  autocmd BufEnter * call s:OnFileEnter()
+augroup END
+
 " ------------------------------ job control --------------------------------
 
 function! s:UserPrompt(text)
@@ -991,7 +919,7 @@ function! s:UserPrompt(text)
     if l:ctx !=# '' && isdirectory(fnamemodify(l:ctx, ':h'))
       if filereadable(l:ctx)
         let l:msg = 'The file I am working on is: ' . l:ctx
-              \ . ' (read it with your read tool; edit it in place when asked).' . "\n"
+              \ . ' (read it if you need its contents; edit it in place when asked).' . "\n"
               \ . a:text
       else
         let l:msg = 'The file I am working on is: ' . l:ctx
@@ -1004,8 +932,12 @@ function! s:UserPrompt(text)
   if g:pi_chat_streaming_behavior !=# ''
     let l:cmd.streamingBehavior = g:pi_chat_streaming_behavior
   endif
-  call s:Send(l:cmd)
-  call s:BusyStart()
+  " Only arm the busy state when the prompt actually reached the channel:
+  " a failed send (dead agent) would otherwise leave the spinner running
+  " and the input guard discarding every keystroke until vim is restarted.
+  if s:Send(l:cmd)
+    call s:BusyStart()
+  endif
 endfunction
 
 function! s:JobAlive()
@@ -1022,19 +954,32 @@ function! s:JobAlive()
   endtry
 endfunction
 
+" Returns 1 if the command reached the channel, 0 on failure. A failed send
+" (agent dead or channel broken) clears the working state, so a prompt sent
+" into a dead agent cannot leave the panel stuck with a permanent spinner
+" and a busy input guard swallowing every keystroke until vim is restarted.
 function! s:Send(dict)
   if !s:JobAlive()
-    call s:AddLogLines(['', '⚠ agent process is not running (use :PiOpen)'])
-    return
+    call s:SendFail('agent process is not running (use :PiOpen)')
+    return 0
   endif
   let s:req_id += 1
   let l:payload = a:dict
   let l:payload.id = 'req-' . s:req_id
   try
     call ch_sendraw(s:job, json_encode(l:payload) . "\n")
+    return 1
   catch
-    call s:AddLogLines(['', '⚠ failed to talk to pi: ' . v:exception])
+    call s:SendFail('failed to talk to pi: ' . v:exception .
+          \ ' (use :PiClear to restart the agent)')
+    return 0
   endtry
+endfunction
+
+function! s:SendFail(msg)
+  call s:HideWorking()
+  call s:BusyStop()
+  call s:AddLogLines(['', '⚠ ' . a:msg])
 endfunction
 
 " Spawns `pi --mode rpc` as a background job. Output arrives line by line
@@ -1245,6 +1190,12 @@ function! s:StartJob()
 
   call s:OpenWindow()
 
+  " A restarted process has no memory of the old one: drop a stale working
+  " line / busy flag left behind if the agent died while a send was in
+  " flight, so the :PiOpen recovery path always lands on a usable panel.
+  call s:HideWorking()
+  call s:BusyStop()
+
   let s:running = 0
   let s:queue = []
   let s:tail = ''
@@ -1258,11 +1209,35 @@ function! s:StartJob()
     let s:session_id = ''
   elseif g:pi_chat_session_resume
     let [l:sid, s:resumed_kind] = s:ChooseSessionId(s:context_file)
+    if s:clear_new_session
+      " :PiClear restarts the process for a fresh session instead of sending
+      " pi an in-process `new_session` command: replacing the session
+      " invalidates the context objects that loaded extensions keep, and
+      " pi-observational-memory then throws "stale ctx" in
+      " maybeTriggerCompaction on the next settled turn and exits the agent
+      " with code 1.  A fresh process has a fresh context.
+      "
+      " The pre-clear session file for this id is deleted before launch:
+      " create-or-resume with the id then starts a *new* session, but under
+      " the same stable context-keyed id, so a later :PiOpen (even after a
+      " full vim restart) resumes the post-clear session.  An ad-hoc id
+      " would orphan the context mapping and make the next open resume the
+      " pre-clear session instead.
+      let l:old_files = glob(s:SessionBaseDir() . '/*/*' . l:sid . '.jsonl', 1, 1)
+      if type(l:old_files) == v:t_string
+        let l:old_files = split(l:old_files, "\n")
+      endif
+      for l:old in l:old_files
+        call delete(l:old)
+      endfor
+      let s:resumed_kind = ''
+    endif
     let s:session_id = l:sid
     call extend(l:cmd, ['--session-id', l:sid])
   else
     let s:session_id = ''
   endif
+  let s:clear_new_session = 0
   call extend(l:cmd, g:pi_chat_args)
 
   let l:opts = {
@@ -1380,6 +1355,116 @@ function! s:PiModel(pattern)
   call s:Send({'type': 'set_model', 'provider': l:parts[0], 'modelId': l:parts[1]})
 endfunction
 
+" Fires on every BufEnter, and is also called directly by s:PanelGuard after
+" it moves a file buffer out of a panel window (buffer switches made inside a
+" BufEnter autocmd do not reliably fire new BufEnter events, so the swap
+" drives this call itself).
+"
+" React only when a:buf is a real file (not chat, thinking panel, or any
+" virtual buffer) and differs from the current context file.  When the agent
+" is running, send pi a short prompt so it knows the working file changed;
+" when it is not, just remember the file for the next :PiOpen.
+function! s:FileSwitch(buf) abort
+  if !g:pi_chat_track_files
+    return
+  endif
+  if a:buf <= 0 || a:buf == s:buf || a:buf == s:think_buf
+    return
+  endif
+  " An unnamed buffer is never a context file.  (bufname is checked directly
+  " because fnamemodify('', ':p') expands to the working directory.)
+  if empty(bufname(a:buf))
+    return
+  endif
+  let l:fn = fnamemodify(bufname(a:buf), ':p')
+  if !empty(getbufvar(a:buf, '&buftype'))
+    return
+  endif
+  " The chat buffers may not have buftype=nofile set yet when BufEnter
+  " fires on their creation, so match their names as well.
+  if bufname(a:buf) =~# '^__PiChat'
+    return
+  endif
+  " The same buffer can surface with different path spellings (e.g. /tmp vs
+  " /private/tmp), so compare buffer numbers, not just path strings.
+  if l:fn ==# s:context_file || a:buf == s:context_buf
+    return
+  endif
+  let s:context_file = l:fn
+  let s:context_buf = a:buf
+  if !s:JobAlive()
+    return
+  endif
+  let l:msg = 'I switched the file I am working on to: ' . l:fn
+        \ . ' (read it if you need its contents).'
+  call s:WithChatWin(function('s:FileSwitchLog', [l:fn]))
+  let l:cmd = {'type': 'prompt', 'message': l:msg}
+  if g:pi_chat_streaming_behavior !=# ''
+    let l:cmd.streamingBehavior = g:pi_chat_streaming_behavior
+  endif
+  call s:Send(l:cmd)
+endfunction
+
+function! s:OnFileEnter() abort
+  call s:FileSwitch(bufnr('%'))
+endfunction
+
+" Keeps the panels in their own windows.  If the cursor happens to sit on
+" the chat or thinking panel and the user runs a buffer-switching command
+" (:e file, :b, :bn, the buffer list, ...), the file buffer takes over the
+" panel's window.  The panel buffer is bufhidden=hide, so it survives; put
+" the file into the last real-file window and restore the panel in place,
+" as if the command had been typed in the file window.  Without a live
+" file window the file simply stays where the user put it (:PiOpen brings
+" the panel back).
+function! s:PanelGuard() abort
+  let l:wid = win_getid()
+  let l:bn = bufnr('%')
+  " Panel buffers may lack buftype=nofile for one tick on creation, so the
+  " name is the reliable test.
+  if bufname('%') =~# '^__PiChat'
+    let s:panel_wins[l:wid] = l:bn
+    return
+  endif
+  if !empty(getbufvar('%', '&buftype'))
+    return
+  endif
+  " A real file buffer just entered window l:wid.
+  if !has_key(s:panel_wins, l:wid)
+    let s:file_win = l:wid
+    return
+  endif
+  let l:panel = s:panel_wins[l:wid]
+  unlet s:panel_wins[l:wid]
+  if !bufexists(l:panel) || getbufvar(l:panel, '&bufhidden') !=# 'hide'
+    return
+  endif
+  if s:file_win ==# l:wid || s:file_win == 0 || win_id2win(s:file_win) == -1
+    let s:file_win = l:wid
+    return
+  endif
+  " Restore the panel in its own window (we are still in l:wid) ...
+  execute 'silent buffer ' . l:panel
+  " ... then show the file in the user's file window.  This order matters:
+  " the file's BufEnter triggers the context-switch log, which must land in
+  " the chat window, not in the file window.
+  call win_gotoid(s:file_win)
+  execute 'silent buffer ' . l:bn
+  " Stay where the user's cursor was (the panel window).
+  call win_gotoid(l:wid)
+  " The swap happened inside the file's BufEnter, whose autocmd chain sees
+  " the panel buffer again (and nested :buffer calls do not reliably refire
+  " BufEnter): drive the context switch ourselves so the log lands in the
+  " restored panel and pi is told about the file.
+  call s:FileSwitch(l:bn)
+endfunction
+
+" Runs with the chat window current; keep it side-effect-free apart from the
+" log line (s:WithChatWin runs the closure synchronously).
+function! s:FileSwitchLog(name) abort
+  call s:AddLogLines(['', 'pi-chat: context file switched: ' . a:name])
+endfunction
+
 function! s:PiFile(path)
   if a:path ==# ''
     if s:context_file ==# ''
@@ -1397,6 +1482,7 @@ function! s:PiFile(path)
     return
   endif
   let s:context_file = l:f
+  let s:context_buf = bufnr(l:f)
   call s:AddLogLines(['pi-chat: context file: ' . l:f
         \ . (s:JobAlive() ? ' (cwd applies from next :PiOpen)' : '')])
 endfunction
@@ -1506,10 +1592,26 @@ function! s:PiClear()
   " input_line (a live ⏳ line above the prompt would otherwise be wiped without
   " decrementing the tracked line numbers).
   call s:HideWorking()
-  call s:Send({'type': 'new_session'})
+  " The new session has no thinking yet, so clear the thinking panel along
+  " with the transcript (otherwise the old session's thoughts linger).
   call s:ThinkReset()
+  " Restart the agent process for a brand-new session instead of sending pi
+  " an in-process `new_session` command: replacing the session invalidates
+  " the context objects that loaded extensions keep, and
+  " pi-observational-memory then throws "stale ctx" in
+  " maybeTriggerCompaction on the next settled turn and exits the agent with
+  " code 1 (see the s:clear_new_session note in s:StartJob).  A fresh process
+  " has a fresh context, and a process restart is already how :PiOpen picks a
+  " parked session back up.  s:fresh stays 0: keep the prompt line (and any
+  " half-typed text) instead of re-emitting the fresh-session hint.
+  call s:StopJob()
+  let s:clear_new_session = 1
+  let s:fresh = 0
+  call s:StartJob()
+  " Wipe the transcript above the input line and record the reset in the log
+  " (s:input_line points at the prompt line now, so the wipe runs after
+  " s:StartJob has re-pointed it).
   if s:buf > 0 && buflisted(s:buf) && s:input_line > 1 && s:input_line - 1 <= line('$')
-    " Wipe the transcript above the input line.
     call setline(1, repeat([''], s:input_line - 1))
     let s:tail = ''
     let s:tail_line = 0
@@ -1674,7 +1776,7 @@ function! PiChatAbort()
 endfunction
 
 function! s:BufSetup()
-  setlocal buftype=nofile bufhidden=hide noswapfile nonumber norelativenumber
+  setlocal buftype=nofile bufhidden=hide noswapfile nonumber norelativenumber nospell
   setlocal wrap linebreak cursorline foldcolumn=0
   setlocal statusline=%{PiChatStatusText()}
 
@@ -1766,6 +1868,13 @@ function! s:OnErr(ch, lines)
 endfunction
 
 function! s:OnExit(ch, code)
+  " Ignore a stale exit event from a job that has already been replaced:
+  " :PiClear restarts the process synchronously, and the old process's exit
+  " can be delivered after the new job has started (s:job then holds a
+  " different channel, and s:StopJob() below would kill the live one).
+  if !empty(s:job) && job_getchannel(s:job) != a:ch
+    return
+  endif
   let l:was_alive = s:JobAlive()
   let l:code = a:code
   call s:StopJob()
