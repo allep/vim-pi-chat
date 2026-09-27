@@ -23,9 +23,10 @@ agent is running reuses the live conversation.
 ==============================================================================
 Commands                                                          *pi_chat-commands*
 
-:PiOpen [<args>]                                              *:PiOpen*
-    Open (or focus) the chat window and start the agent. <args> are appended
-    to the pi command line (in addition to |g:pi_chat_args|).
+:PiOpen [<message>]                                           *:PiOpen*
+    Open (or focus) the chat window and the thinking panel and start the
+    agent. If <message> is given it is sent as the first prompt after
+    opening (outer quotes are stripped).
 
 :PiSend [<args>]                                              *:PiSend*
     Send a prompt to the agent from anywhere (opening the chat first if
@@ -35,18 +36,29 @@ Commands                                                          *pi_chat-comma
     Ask the agent to stop the current run.
 
 :PiModel <provider/modelId>                                   *:PiModel*
-    Switch the agent's model and confirm it took effect.
+    Switch the agent's model and confirm it took effect, e.g.
+    :PiModel anthropic/claude-sonnet-4-5.
 
 :PiClear                                                      *:PiClear*
-    Start a fresh conversation (sends a `new_session` to the running agent).
+    Start a fresh conversation by restarting the agent process with a new
+    session id (deliberately not an in-process `new_session`: replacing the
+    session invalidates the contexts loaded extensions keep).
+
+:PiThinking                                                   *:PiThinking*
+    Toggle the read-only thinking panel below the chat (opened
+    automatically with :PiOpen). Streams the model's thinking live,
+    auto-scrolled to the newest line; height is |g:pi_chat_thinking_height|.
+    Thoughts accumulate even while hidden, under a `──── prompt` marker per
+    turn, so opening it later shows past thinking; :PiClear / :PiClose wipe
+    it.
 
 :PiClose                                                      *:PiClose*
-    Close the chat window and stop the agent.
+    Close the chat window and stop the agent (tears the session down).
 
 :PiFile [<file>]                                              *:PiFile*
-    Point the chat at <file> (default: the current buffer). The file is
-    injected into future prompts as context and its directory becomes the
-    agent's working directory.
+    Point the chat at <file>: the file is injected into future prompts as
+    context and its directory becomes the agent's working directory. With
+    no argument, print the current context file.
 
 ==============================================================================
 Options                                                             *g:pi_chat_*
@@ -79,8 +91,20 @@ g:pi_chat_streaming_behavior                  *g:pi_chat_streaming_behavior*
     Default: 'followUp'
 
 g:pi_chat_show_thinking                            *g:pi_chat_show_thinking*
-    Render thinking deltas as they stream.
+    Also render thinking deltas inline in the chat as they stream (in
+    addition to the :PiThinking panel).
     Default: 0
+
+g:pi_chat_thinking_height                      *g:pi_chat_thinking_height*
+    Height of the :PiThinking panel: a float between 0 and 1 is a
+    fraction of the chat window; an integer is a row count.
+    Default: 0.3
+
+g:pi_chat_markdown                               *g:pi_chat_markdown*
+    0 disables the built-in buffer-local markdown highlighting in the
+    chat and thinking panels (headings, bold/italic, inline and fenced
+    code, lists, quotes and links).
+    Default: 1
 
 g:pi_chat_map                                                *g:pi_chat_map*
     Global normal-mode mapping for :PiOpen. Set to '' to disable.
@@ -98,10 +122,28 @@ g:pi_chat_track_files                          *g:pi_chat_track_files*
     Set to 0 to disable and manage the context file manually with :PiFile.
     Default: 1
 
+g:pi_chat_master_prompt                        *g:pi_chat_master_prompt*
+    Standing rules for the whole conversation. A file path (e.g.
+    "~/.pi-master-prompt.md") or a plain string of instructions is passed
+    to pi with --append-system-prompt, so the rules are in the system
+    prompt from the first message of every session (fresh and resumed).
+    A readable file is sent as an absolute path and pi loads its
+    contents; anything else is treated as inline text. The chat log
+    shows which one was applied on a fresh start. Changes take effect
+    when the pi job restarts (e.g. :PiClear, or :PiClose + :PiOpen).
+    Default: ''
+
 g:pi_chat_autosave_context                      *g:pi_chat_autosave_context*
     When the context file has unsaved changes at send time: 1 saves it
     automatically; 0 (default) prompts you to save or cancel first.
     Default: 0
+
+g:pi_chat_run_timeout                          *g:pi_chat_run_timeout*
+    A watchdog warning, not a timeout: while a run is in flight, once it
+    exceeds N seconds the chat logs "⏱ pi run exceeded Ns - may be stuck"
+    and the status line shows "(long run: :PiClose to stop)". The agent
+    keeps running; :PiClose force-stops it. 0 disables the warning.
+    Default: 300
 
 g:pi_chat_session_resume                      *g:pi_chat_session_resume*
     :PiOpen resumes the pi conversation for the context file (else its

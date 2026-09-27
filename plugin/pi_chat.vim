@@ -51,6 +51,10 @@ set cpo&vim
 "   g:pi_chat_map                  global normal-mode mapping, default <leader>pi
 "   g:pi_chat_context_file         1 = inject the context file into prompts
 "   g:pi_chat_track_files          1 = tell pi when you switch files (:e, :b)
+"   g:pi_chat_master_prompt        path to a markdown file (or inline text) with
+"                                  standing rules, appended to pi's system prompt
+"                                  when the session starts (~ and relative paths
+"                                  are expanded from vim's cwd)
 "
 " Protocol reference: pi docs/rpc.md
 " ---------------------------------------------------------------------------
@@ -86,6 +90,9 @@ if !exists('g:pi_chat_map')                  | let g:pi_chat_map = '<leader>pi' 
 if !exists('g:pi_chat_context_file')         | let g:pi_chat_context_file = 1 | endif
 if !exists('g:pi_chat_track_files')          | let g:pi_chat_track_files = 1 | endif
 if !exists('g:pi_chat_autosave_context')     | let g:pi_chat_autosave_context = 0 | endif
+" Master prompt: a file (or inline text) of standing rules, passed to pi with
+" --append-system-prompt so every session starts with it in the system prompt.
+if !exists('g:pi_chat_master_prompt')        | let g:pi_chat_master_prompt = '' | endif
 " Auto-resume a pi session keyed to the file you opened (then its folder):
 " the file/folder -> session association is implicit, via a stable id derived
 " from the path and passed to pi with --session-id (create-or-resume).
@@ -1238,6 +1245,19 @@ function! s:StartJob()
     let s:session_id = ''
   endif
   let s:clear_new_session = 0
+  " Master prompt (g:pi_chat_master_prompt): standing rules appended to pi's
+  " system prompt for the whole session. A readable file path is passed as a
+  " path (pi loads its contents; expand ~ and make it absolute since pi
+  " resolves relative paths from the job's cwd, not vim's); anything else is
+  " treated as inline text, which is pi's own fallback for --append-system-prompt.
+  if !empty(g:pi_chat_master_prompt)
+    let l:mp = expand(g:pi_chat_master_prompt, 1)
+    if filereadable(l:mp)
+      call extend(l:cmd, ['--append-system-prompt', fnamemodify(l:mp, ':p')])
+    else
+      call extend(l:cmd, ['--append-system-prompt', g:pi_chat_master_prompt])
+    endif
+  endif
   call extend(l:cmd, g:pi_chat_args)
 
   let l:opts = {
@@ -1285,6 +1305,11 @@ function! s:StartJob()
 
   if s:fresh
     call s:AddLogLines(['', 'pi chat — <CR> sends · <C-CR> newline · <C-c> abort'])
+    if !empty(g:pi_chat_master_prompt)
+      call s:AddLogLines(['📋 master prompt: ' . (filereadable(expand(g:pi_chat_master_prompt, 1))
+            \ ? fnamemodify(expand(g:pi_chat_master_prompt, 1), ':p')
+            \ : '(inline ' . strlen(g:pi_chat_master_prompt) . ' chars)')])
+    endif
     if s:resumed_kind ==# 'file' || s:resumed_kind ==# 'dir'
       let l:what = s:resumed_kind ==# 'file' ? 'this file''s' : 'this folder''s'
       call s:AddLogLines(['↻ resumed ' . l:what . ' pi session'])

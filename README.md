@@ -92,9 +92,10 @@ thinking panel, the file is moved into your last real-file window and the
 panel is restored in place, so a stray `:e` can never replace a panel. With
 no file window open the file stays put and `:PiOpen` brings the panel back.
 
-Sessions persist the usual way — pi stores them in `~/.pi/sessions` and
-resumes by default; each `:PiOpen` continues the most recent session. Use
-`g:pi_chat_no_session = 1` for `--no-session`.
+Sessions persist the usual way — pi stores them in
+`~/.pi/agent/sessions` and `:PiOpen` resumes the conversation for the
+context file (see Resuming a conversation). Use `g:pi_chat_no_session = 1`
+for `--no-session`.
 
 ### Working on an open file
 
@@ -159,6 +160,7 @@ let g:pi_chat_markdown = 1              " 0 = disable the built-in markdown high
 let g:pi_chat_map = '<leader>pi'        " '' disables the global mapping
 let g:pi_chat_context_file = 1          " 1 = inject the context file into prompts
 let g:pi_chat_track_files = 1           " 1 = re-key pi's context when you switch files (:e, :b, …)
+let g:pi_chat_master_prompt = ''        " file path (or inline text) of standing rules, appended to pi's system prompt
 let g:pi_chat_autosave_context = 0      " 1 = save the context file before each send (else prompt)
 let g:pi_chat_run_timeout = 300         " 0 = off; N = warn if a run is still busy after N seconds
 let g:pi_chat_session_resume = 1        " 1 = :PiOpen resumes the file's (or folder's) pi conversation
@@ -176,6 +178,15 @@ buffer-local Vim highlighting (`g:pi_chat_markdown`, on by default):
 headings, bold/italic, inline and fenced code, lists, quotes and links, all
 layered on as the buffer streams in. Set `g:pi_chat_markdown = 0` to turn
 it off.
+
+`g:pi_chat_master_prompt` sets standing rules for the whole conversation: a
+file path (e.g. `"~/.pi-master-prompt.md"`) or a plain string of instructions
+is passed to pi with `--append-system-prompt`, so the rules are in the system
+prompt from the first message of every session (fresh and resumed). A
+readable file is sent as an absolute path and pi loads its contents; anything
+else is treated as inline text. The chat log shows which one was applied when
+a fresh session starts. Changes take effect when the pi job restarts (e.g.
+`:PiClear`, or `:PiClose` + `:PiOpen`).
 
 `g:pi_chat_autosave_context` controls what happens when you send a prompt with
 unsaved changes in the context file: `1` saves it to disk first (so pi edits
