@@ -23,10 +23,15 @@ agent is running reuses the live conversation.
 ==============================================================================
 Commands                                                          *pi_chat-commands*
 
-:PiOpen [<message>]                                           *:PiOpen*
+:PiOpen [quiet | <message>]                                   *:PiOpen*
     Open (or focus) the chat window and the thinking panel and start the
     agent. If <message> is given it is sent as the first prompt after
     opening (outer quotes are stripped).
+
+    With `quiet` the chat is opened without stealing focus: no window jump
+    and no insert mode on the prompt. Intended for the VimEnter boot hook,
+    so that stray startup input can never be silently sent to the agent as
+    a message.
 
 :PiSend [<args>]                                              *:PiSend*
     Send a prompt to the agent from anywhere (opening the chat first if

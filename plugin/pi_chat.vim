@@ -178,6 +178,11 @@ let s:queue = []
 let s:drain_timer = ''
 let s:req_id = 0
 let s:pending_msg = ''
+" 1 = the :PiOpen that started this job passed the `quiet` flag: open the
+" chat split but do NOT move the cursor to the prompt in insert mode
+" (used by the VimEnter boot hook so stray input at startup can never be
+" silently sent to the agent as a message).
+let s:quiet = 0
 " 1 = about to create a brand-new session, 0 = resuming a parked one.
 let s:fresh = 1
 " Set by :PiClear: the next s:StartJob must launch a brand-new session even
@@ -197,7 +202,11 @@ let s:spin_frames =
 " ------------------------------- public API --------------------------------
 
 function! s:PiOpen(...)
-  if a:0 > 0
+  " :PiOpen quiet — open (or reveal) the chat without stealing focus: no
+  " window jump, no insert mode on the prompt.
+  let l:quiet = (a:0 > 0 && a:1 ==# 'quiet')
+  let s:quiet = l:quiet
+  if a:0 > 0 && !l:quiet
     let s:pending_msg = a:1
     let l:len = strlen(s:pending_msg)
     let l:dq = nr2char(34)
@@ -209,6 +218,11 @@ function! s:PiOpen(...)
   endif
 
   if s:JobAlive() && s:buf > 0 && buflisted(s:buf)
+    if l:quiet
+      " Stay put: only make sure the thinking panel is not left hidden.
+      call s:PiShowThinking()
+      return
+    endif
     call s:JumpToBuf()
     if !empty(s:pending_msg)
       let l:m = s:pending_msg
@@ -1249,6 +1263,10 @@ function! s:MessageThinking(msg) abort
 endfunction
 
 function! s:StartJob()
+  " Consume the quiet flag up front: a failed job start must not leave it
+  " set for a later, explicit :PiOpen.
+  let l:quiet = s:quiet
+  let s:quiet = 0
   if !executable('pi')
     echohl ErrorMsg
     echomsg 'pi-chat: pi executable not found on PATH'
@@ -1399,7 +1417,9 @@ function! s:StartJob()
   endif
   let s:input_line = line('$')
   call s:CaptureTranscript()
-  call s:GotoInputInsert()
+  if !l:quiet
+    call s:GotoInputInsert()
+  endif
 endfunction
 
 function! s:StopJob()

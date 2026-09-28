@@ -65,6 +65,7 @@ Requirements:
 | --- | --- |
 | `:PiOpen` | open the chat **and** the thinking panel (chat in a vertical split on the right by default) |
 | `:PiOpen <message>` | open (chat + thinking) and immediately send `<message>` |
+| `:PiOpen quiet` | open (chat + thinking) without moving the cursor to the prompt (no focus steal, no insert mode) — used by the VimEnter boot hook so stray startup input can never be sent to the agent |
 | `:PiSend <text>` | send a prompt (no text: jump to the chat and start typing) |
 | `:PiAbort` | abort the current run (`{"type":"abort"}`) |
 | `:PiClear` | start a fresh session (restarting the agent process with a new session id, so extensions never see a replaced session) |
