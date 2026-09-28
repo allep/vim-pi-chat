@@ -177,6 +177,43 @@ at all, and pi then applies its own default (resume most recent session).
 The config below turns it off or tunes the fallback and how much history is
 shown.
 
+### Opening the chat at startup (without stealing focus)
+
+If you want the panel already open when vim starts, hook `:PiOpen` into
+`VimEnter`. The safe form is a small boot function:
+
+```vim
+" Open the chat panel at startup, without stealing focus.
+function! s:pi_boot() abort
+  if exists(':PiOpen') && !&diff && (has('terminal') || has('gui_running'))
+    let s:pi_boot_win = win_getid()
+    PiOpen quiet
+    call win_gotoid(s:pi_boot_win)
+    unlet s:pi_boot_win
+  endif
+endfunction
+autocmd VimEnter * call s:pi_boot()
+```
+
+There are two reasons for the exact shape:
+
+1. **Focus.** A plain `:PiOpen` leaves the cursor in the chat's insert-mode
+   prompt, so your first keystroke after startup would be typed into the
+   prompt (and `<CR>` there sends it to pi). `:PiOpen quiet` starts the job
+   and opens the split but skips the insert-mode focus, and `win_gotoid()`
+   returns the cursor to the window you were in. Both parts matter: the chat
+   window still gains focus the moment the split opens (the window manager
+   does that), and pi's first streamed output re-focuses it — so
+   `win_gotoid` alone is not enough; it is the quiet flag that keeps your
+   keystrokes out of the prompt.
+
+2. **Keep `:PiOpen` alone on its line.** The command is `-nargs=*`, and at
+   least one stripped-down vim build parses the rest of a `|`-chained logical
+   line as part of its argument: `... | PiOpen quiet | win_gotoid(w)` made
+   `:PiOpen` receive the whole string `quiet | win_gotoid(w)` and send it to
+   pi as a user message — a stray boot send. Wrapping the call in a function
+   so `PiOpen quiet` sits alone on its line sidesteps that completely.
+
 ## Configuration (`.vimrc`)
 
 ```vim
