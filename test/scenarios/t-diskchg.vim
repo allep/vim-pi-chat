@@ -1,15 +1,15 @@
 " vim: set ft=vim ts=2 sw=2 sts=2 et:
-" Scenario: a tool OTHER than edit/write (a bash sed) rewrites the tracked
+" Scenario: a tool OTHER than edit/write (a bash one-liner) rewrites the tracked
 " context file on disk.  The open buffer must reload to the new content and
 " not be left marked modified, and the chat must note the external change.
-" Runner env: FAKE_PI_TOOL=bash plus FAKE_PI_BASH_CMD (a sed that rewrites
-" one line of /tmp/t-diskchg-ctx.txt; the fake really executes it).
+" Runner env: FAKE_PI_TOOL=bash plus FAKE_PI_BASH_CMD (a POSIX shell rewrite
+" of /tmp/t-diskchg-ctx.txt; the fake really executes it).
 set nocompatible
 set noswapfile
 let s:root = fnamemodify(resolve(expand('<sfile>:p')), ':h:h:h')
 let g:pi_chat_context_file = 1
 let g:pi_chat_session_resume = 0
-" Four lines; the bash sed replaces line 2 (in place, same line count).
+" Four lines; the bash rewrite keeps the same line count.
 call writefile(['alpha', 'zqx7k-old', 'beta', 'delta'], '/tmp/t-diskchg-ctx.txt')
 execute 'source ' . fnameescape(s:root . '/plugin/pi_chat.vim')
 call writefile([], '/tmp/t-diskchg.txt')

@@ -113,13 +113,16 @@ process.stdin.on('data', (chunk) => {
                   // announcing the end, so the plugin's live reload has it.
                   require('fs').writeFileSync(editPath, args.content);
                 }
+                let cmdErr = false;
                 if (name === 'bash' && process.env.FAKE_PI_BASH_CMD) {
                   // Same deal for bash: really run the command before
                   // announcing the end (the plugin can then reload any file
-                  // it rewrote).
-                  require('child_process').execSync(bashCmd, { stdio: 'ignore' });
+                  // it rewrote). A failing command is a tool error (like
+                  // real pi), not a crash of the fake process.
+                  try { require('child_process').execSync(bashCmd, { stdio: 'ignore' }); }
+                  catch (e) { cmdErr = true; }
                 }
-                const end = { type: 'tool_execution_end', toolName: name, isError: toolFail && name === tools[0] };
+                const end = { type: 'tool_execution_end', toolName: name, isError: (toolFail && name === tools[0]) || cmdErr };
                 if (name === 'edit') {
                   // pi hands the TUI a pre-formatted display diff for edits.
                   end.result = { content: [{ type: 'text', text: 'ok' }],

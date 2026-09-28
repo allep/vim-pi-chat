@@ -127,7 +127,7 @@ background (the plugin forces a full redraw after reloading, since vim may
 otherwise not repaint a non-current window until your next keystroke). This
 covers the edit/write tools, and — because the plugin snapshots the file's
 `[mtime, size]` around every tool call — *any* tool that rewrites the file
-(a `bash` `sed` included), logged as `ℹ reloaded TODO (changed on disk)`.
+(a `bash` one-liner included), logged as `ℹ reloaded TODO (changed on disk)`.
 If the buffer has unsaved changes of your own, the reload is skipped with a
 notification and a `:e!` hint, so it never clobbers your in-progress edits.
 

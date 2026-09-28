@@ -136,7 +136,9 @@ for f in test/scenarios/t-*.vim; do
     diskchg)  export FAKE_PI_THINKING= FAKE_PI_TOOL=bash
                # The fake really runs this command: it rewrites the tracked
                # context file on disk from a NON edit/write tool.
-               export FAKE_PI_BASH_CMD="sed -i '' 's/zqx7k-old/zqx7k-new/' /tmp/t-diskchg-ctx.txt"
+               # POSIX rewrite (BSD-only 'sed -i ''' breaks GNU sed on Linux CI):
+               # the file is exactly these four lines, line 2 flipped to the new marker.
+               export FAKE_PI_BASH_CMD="printf 'alpha\nzqx7k-new\nbeta\ndelta\n' > /tmp/t-diskchg-ctx.txt"
                run diskchg 12
                # the open buffer shows the sed'd content, unmodified, and the
                # chat notes the external change
