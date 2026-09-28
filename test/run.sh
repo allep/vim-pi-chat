@@ -118,12 +118,6 @@ for f in test/scenarios/t-*.vim; do
               run fail 4
               check fail '✗ bash failed' '' ''
               export FAKE_PI_TOOLFAIL= ;;
-    model)    export FAKE_PI_THINKING= FAKE_PI_TOOL= FAKE_PI_LOG=/tmp/fakepi-model.log
-              : > /tmp/fakepi-model.log
-              run model 5
-              check model 'set_model' '' ''
-              check model 'gpt-x' '' ''
-              export FAKE_PI_LOG= ;;
     nosession) export FAKE_PI_THINKING= FAKE_PI_TOOL= FAKE_PI_ARGV_LOG=/tmp/fakepi-argv.log
               run nosession 5
               check nosession '--no-session' '' ''
@@ -205,6 +199,56 @@ and then acting"
               check notify '⚠ warn note' '' ''
               check notify '⛔ error note' '' ''
               export FAKE_PI_NOTIFY_ALL= ;;
+    notifycursor) export FAKE_PI_THINKING= FAKE_PI_TOOL= FAKE_PI_LATE_NOTIFY_MS=800
+                  run notifycursor 6
+                  # the late notify renders in the log, and the cursor stays
+                  # where the user typed (col 8, after 'abc') instead of being
+                  # yanked back to col 5 (right after '❯ ') by the drain tick
+                  check notifycursor 'ℹ late note' 'CURSOR [0-9]*:5' ''
+                  check notifycursor 'CURSOR [0-9]*:8' '' ''
+                  export FAKE_PI_LATE_NOTIFY_MS= ;;
+    cursorprompt) export FAKE_PI_THINKING= FAKE_PI_TOOL=
+                  run cursorprompt 5
+                  # after the reply settles, the cursor must rest AFTER the ❯
+                  # marker (byte col strlen('❯ ')+1 on a bare '❯ ' line), not in
+                  # front of it: the glyph is blanked while pi works (cursor
+                  # clamps to byte col 1) and HideWorking puts '❯ ' back with no
+                  # cursor move, so the drain tick's s:StickToInput must re-anchor
+                  # after the turn settles: input is '❯ ' with the cursor behind it (byte col 5,
+                  # where the first typed char lands) — never in front of the glyph
+                  check cursorprompt 'CURSOR [0-9]+:5 LAST=[0-9]+ OK' 'CURSOR [0-9]*:1 LAST= BAD' ;;
+    modelstatus) export FAKE_PI_THINKING= FAKE_PI_TOOL=
+                  run modelstatus 5
+                  # the statusline right segment must show the model from pi's
+                  # get_state response (fake: provider 'fake', id 'pi-test');
+                  # s:Final dumps PiChatStatusModel() as a 'MODEL …' line
+                  check modelstatus 'Echo: hello' '' ''
+                  check modelstatus 'MODEL fake/pi-test' 'MODEL *$' ''
+                  ;;
+    blankgap) export FAKE_PI_THINKING= FAKE_PI_TRAILING_NEWLINES=2
+              run blankgap 5
+              # model text 'Echo: hello\n\n' must not balloon the gap before
+              # the tool line: at most ONE consecutive blank line anywhere in
+              # the buffer (pre-fix the trailing \n\n + tail placeholder +
+              # turn separator stacked to 3 blanks between text and tool)
+              check blankgap 'Echo: hello' '' ''
+              check blankgap '  ⚙ bash' '' ''
+              check blankgap 'BLANK MAX=1' 'BLANK MAX=[2-9]' ''
+              export FAKE_PI_TRAILING_NEWLINES= ;;
+    restart)  export FAKE_PI_THINKING= FAKE_PI_TOOL= FAKE_PI_ARGV_LOG=/tmp/t-restart-argv.log
+              : > /tmp/t-restart-argv.log
+              run restart 6
+              # :PiRestart must keep the transcript (both replies survive) and
+              # must NOT start a new session or wipe the log
+              check restart 'Echo: first' 'new session' ''
+              check restart 'pi process restarted' '' ''
+              check restart 'Echo: second' '' ''
+              # both launches must carry the SAME --session-id (resume, not new)
+              if node -e 'const fs=require("fs");const l=fs.readFileSync("/tmp/t-restart-argv.log","utf8").trim().split("\n").filter(Boolean).map(s=>JSON.parse(s));const id=a=>{const i=a.indexOf("--session-id");return i<0?null:a[i+1];};if(l.length!==2)throw new Error("expected 2 launches, got "+l.length);if(!id(l[0])||!id(l[1]))throw new Error("missing --session-id in launch");if(id(l[0])!==id(l[1]))throw new Error("PiRestart must resume the same session id");' 2>/dev/null
+              then record restart-argv 1
+              else record restart-argv 0 "same-session restart not observed in argv log"
+              fi
+              export FAKE_PI_ARGV_LOG= ;;
     stall)    echo "[stall] manual-only: a slow fake (FAKE_PI_DELAY_MS>1s) triggers a headless hit-enter barrier."
               echo "[stall] Verify by hand: the status line shows 'pi run exceeded Ns - may be stuck'. Scenario: test/scenarios/t-stall.vim" ;;
     resume)   export FAKE_PI_THINKING= FAKE_PI_TOOL= FAKE_PI_ARGV_LOG=/tmp/fakepi-argv.log

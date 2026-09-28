@@ -9,6 +9,7 @@ set nocompatible
 set noswapfile
 let s:root = fnamemodify(resolve(expand('<sfile>:p')), ':h:h:h')
 let g:pi_chat_context_file = 0
+let g:pi_chat_no_session = 1
 execute 'source ' . fnameescape(s:root . '/plugin/pi_chat.vim')
 call writefile([], '/tmp/t-thinkpanel.txt')
 

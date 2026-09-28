@@ -65,7 +65,6 @@ Requirements:
 | `:PiOpen <message>` | open (chat + thinking) and immediately send `<message>` |
 | `:PiSend <text>` | send a prompt (no text: jump to the chat and start typing) |
 | `:PiAbort` | abort the current run (`{"type":"abort"}`) |
-| `:PiModel <pattern>` | switch model, e.g. `:PiModel anthropic/claude-sonnet-4-5` |
 | `:PiClear` | start a fresh session (restarting the agent process with a new session id, so extensions never see a replaced session) |
 | `:PiThinking` | toggle a small read-only panel below the chat (opened automatically with `:PiOpen`) streaming the model's thinking live, auto-scrolled to the newest line (height: `g:pi_chat_thinking_height`). Thoughts accumulate even while hidden, under a `──── prompt` marker per turn, so opening it later shows past thinking; `:PiClear` / `:PiClose` wipe it |
 | `:PiClose` | stop the agent and close (tear down) the chat |
@@ -77,7 +76,9 @@ mode, `<CR>` sends (multi-line: continuation lines are joined), and `<C-c>`
 aborts the current run. While pi is generating a turn, typing on the prompt
 is ignored (the prompt glyph is hidden and the input line is blanked — you
 see an in-chat `⏳ pi is working…` line instead — and the statusline
-spinner shows pi is working) — to queue a message explicitly while it is
+spinner shows pi is working). The statusline also shows the current model
+(pi reports it via `get_state` / `set_model` / `cycle_model`); model
+changes are made from the pi side (e.g. pi's own `/model`), not from Vim. — to queue a message explicitly while it is
 busy, use `:PiSend <text>` (handled per `g:pi_chat_streaming_behavior`).
 
 Window switching is non-destructive: closing the chat window (or leaving it
@@ -223,8 +224,9 @@ file). `:PiClear` always forces a brand-new session.
 
 Run the whole end-to-end suite (the basic E2E plus the scenarios in
 `test/scenarios/`: `abort`, `abortreplay`, `abortresume`, `abortdeath`,
-`clear`, `close`, `fail`, `markdown`, `model`, `multi`, `nosession`,
-`notify`, `panelguard`, `pifile`, `pifilecmd`, `pisend`, `resume`, `think`,
+`blankgap`, `clear`, `close`, `cursorprompt`, `fail`, `leak`, `markdown`,
+`modelstatus`, `multi`, `nosession`, `notify`, `notifycursor`, `panelguard`,
+`pifile`, `pifilecmd`, `pisend`, `restart`, `resume`, `resumethink`, `think`,
 `thinkoff`, `thinkpanel`, `tools`, `trackfile`, `working`) from the repo root.
 The `abortreplay` scenario replays a captured real-pi session byte-for-byte
 (`test/replay/`). The `stall` watchdog scenario is
@@ -257,9 +259,8 @@ Notes:
   `FAKE_PI_TOOLFAIL`, `FAKE_PI_TITLE`, `FAKE_PI_DELAY_MS`, `FAKE_PI_TURN_MS`,
   `FAKE_PI_EDIT_PATH`, …) so one stub covers every scenario; it also logs the
   lines it receives (`FAKE_PI_LOG`) and its launch argv (`FAKE_PI_ARGV_LOG`)
-  for protocol assertions (e.g. the `model` scenario asserts the exact
-  `set_model` line sent over stdin, and `nosession` asserts the `--no-session`
-  startup arg).
+  for protocol assertions (e.g. `nosession` asserts the `--no-session`
+  startup arg, `clear` asserts the `--session-id` kept across the restart).
 - `g:pi_chat_run_timeout` watchdog: when a run is still busy past the budget the
   status line appends `(long run: :PiClose to stop)` and one transcript line
   `⏱ pi run exceeded Ns - may be stuck; :PiClose to force-stop` is logged.

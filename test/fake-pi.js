@@ -15,6 +15,12 @@
 //   FAKE_PI_TOOLFAIL=1     the tool ends with isError=true
 //   FAKE_PI_TITLE=t        the notify title (default 'pi')
 //   FAKE_PI_REPLY_PREFIX=  reply prefix (default 'Echo: ')
+//   FAKE_PI_TRAILING_NEWLINES=n  append n newline chars to the reply text
+//                          (real model text routinely ends in \n / \n\n;
+//                          used to test blank-line collapsing in the log)
+//   FAKE_PI_LATE_NOTIFY_MS=n  emit one extra 'late note' notify n ms after
+//                             agent_settled (a background plugin notification
+//                             arriving after the turn, for cursor-park tests)
 //
 // It keeps running until stdin closes (the plugin :quit!s the job to tear it
 // down).
@@ -25,6 +31,15 @@
 if (process.env.FAKE_PI_ARGV_LOG) {
   try { require('fs').appendFileSync(process.env.FAKE_PI_ARGV_LOG, JSON.stringify(process.argv) + '\n'); } catch {}
 }
+
+// Configured model list: FAKE_PI_MODELS='provider:id,provider:id' (default a
+// single model). Mirrors pi: set_model validates against the list (Model not
+// found when absent) and its data IS the model object, get_available_models
+// lists it, cycle_model walks it, get_state reports the current one.
+const FAKE_MODELS = (process.env.FAKE_PI_MODELS || 'fake:pi-test').split(',')
+  .filter(Boolean)
+  .map((s) => { const i = s.indexOf(':'); return { provider: s.slice(0, i), id: s.slice(i + 1), name: s.slice(i + 1) }; });
+let fakeModelIdx = 0;
 
 let buf = '';
 process.stdin.setEncoding('utf8');
@@ -65,7 +80,8 @@ process.stdin.on('data', (chunk) => {
             emit({ type: 'message_end', message: { role: 'assistant' } });
           }
 
-          const reply = `${prefix}${m}`;
+          const trail = '\n'.repeat(parseInt(process.env.FAKE_PI_TRAILING_NEWLINES || '0', 10));
+        const reply = `${prefix}${m}${trail}`;
           emit({ type: 'message_start', message: { role: 'assistant' } });
           for (const c of reply) {
             emit({ type: 'message_update', assistantMessageEvent: { type: 'text_delta', delta: c } });
@@ -107,6 +123,12 @@ process.stdin.on('data', (chunk) => {
             }
             emit({ type: 'agent_end', willRetry: false });
             emit({ type: 'agent_settled' });
+            const late = parseInt(process.env.FAKE_PI_LATE_NOTIFY_MS || '0', 10);
+            if (late > 0) {
+              setTimeout(() => {
+                emit({ type: 'extension_ui_request', id: 'ui-late', method: 'notify', title, message: 'late note', notifyType: 'info' });
+              }, late);
+            }
           }
         }, delay);
         break;
@@ -116,7 +138,34 @@ process.stdin.on('data', (chunk) => {
         emit({ type: 'agent_end', willRetry: false });
         emit({ type: 'agent_settled' });
         break;
-      case 'set_model':
+      case 'get_state':
+        emit({ id: req.id, type: 'response', command: 'get_state', success: true,
+               data: { model: FAKE_MODELS[fakeModelIdx] } });
+        break;
+      case 'get_available_models':
+        emit({ id: req.id, type: 'response', command: 'get_available_models', success: true,
+               data: { models: FAKE_MODELS } });
+        break;
+      case 'set_model': {
+        const i = FAKE_MODELS.findIndex((m) => m.provider === req.provider && m.id === req.modelId);
+        if (i < 0) {
+          emit({ id: req.id, type: 'response', command: 'set_model', success: false,
+                 error: `Model not found: ${req.provider}/${req.modelId}` });
+        } else {
+          fakeModelIdx = i;
+          emit({ id: req.id, type: 'response', command: 'set_model', success: true, data: FAKE_MODELS[i] });
+        }
+        break;
+      }
+      case 'cycle_model':
+        if (FAKE_MODELS.length <= 1) {
+          emit({ id: req.id, type: 'response', command: 'cycle_model', success: true, data: null });
+        } else {
+          fakeModelIdx = (fakeModelIdx + 1) % FAKE_MODELS.length;
+          emit({ id: req.id, type: 'response', command: 'cycle_model', success: true,
+                 data: { model: FAKE_MODELS[fakeModelIdx], thinkingLevel: 'low', isScoped: false } });
+        }
+        break;
       case 'clear':
       case 'new_session':
       default:

@@ -12,7 +12,6 @@ set cpo&vim
 "   :PiOpen fix the bug  open and immediately send a prompt
 "   :PiSend <text>       send a prompt from the command line
 "   :PiAbort             abort the current agent run
-"   :PiModel <pattern>   switch model (e.g. :PiModel anthropic/claude-sonnet-4-5)
 "   :PiClear             start a fresh session
 "   :PiClose             close the chat and stop the agent
 "   :PiThinking          toggle a panel below the chat streaming the model's
@@ -140,6 +139,9 @@ let s:typing_guard = 0
 " buffer where the model's thinking streams live. -1 = never created.
 let s:think_buf = -1       " bufnr of the thinking panel buffer, or -1
 let s:think_text = ''      " full thinking text for the current turn
+" Model label for the statusline (filled from pi's get_state / set_model /
+" cycle_model responses, i.e. only after pi confirmed). Empty until pi answers.
+let s:model_label = ''
 " Buffers already given buffer-local markdown highlighting (avoid dupes).
 let s:md_done = {}
 " Buffer invariants:
@@ -541,6 +543,52 @@ function! PiChatStatusText()
   return type(l:st) == v:t_string ? l:st : ''
 endfunction
 
+" Right-hand statusline part: the model pi is currently using, shown after
+" the '=' separator so it floats right next to 'pi chat' / 'pi is working'.
+" Same double-quote constraint as PiChatStatusText().
+function! PiChatStatusModel()
+  if !exists('s:model_label') || s:model_label ==# ''
+    return ''
+  endif
+  return ' ' . s:model_label . ' '
+endfunction
+
+function! s:SetModelLabel(label)
+  let s:model_label = a:label
+  if s:buf > 0 && buflisted(s:buf) && s:FindWin() > 0
+    silent! redrawstatus
+  endif
+endfunction
+
+" pi's Model object -> short display label 'provider/id' (falls back to the
+" model name when either part is missing).
+function! s:ModelLabelOf(model)
+  if type(a:model) != v:t_dict
+    return ''
+  endif
+  let l:prov = get(a:model, 'provider', '')
+  let l:id = get(a:model, 'id', '')
+  if l:prov !=# '' && l:id !=# ''
+    return l:prov . '/' . l:id
+  endif
+  return get(a:model, 'name', '')
+endfunction
+
+" Pull the Model object out of a response payload: get_state and cycle_model
+" carry it under data.model, while set_model's data IS the model object.
+function! s:ModelObject(data)
+  if type(a:data) != v:t_dict
+    return {}
+  endif
+  if has_key(a:data, 'model') && type(a:data['model']) == v:t_dict
+    return a:data['model']
+  endif
+  if has_key(a:data, 'id') && type(a:data['id']) == v:t_string
+    return a:data
+  endif
+  return {}
+endfunction
+
 function! s:BusyStart()
   let s:busy = 1
   let s:busy_since = reltime()
@@ -882,8 +930,8 @@ command!          PiThinking call s:PiThinking()
 command! -nargs=* PiOpen  call s:PiOpen(<q-args>)
 command! -nargs=* PiSend  call s:PiSend(<q-args>)
 command!          PiAbort call s:PiAbort()
-command! -nargs=1 PiModel call s:PiModel(<f-args>)
 command!          PiClear call s:PiClear()
+command!          PiRestart call s:PiRestart()
 command!          PiClose call s:PiClose()
 command! -nargs=? -complete=file PiFile call s:PiFile(<f-args>)
 
@@ -1303,6 +1351,10 @@ function! s:StartJob()
   " at "contacting pi" and replies never render.
   call s:StartDrain()
 
+  " Ask pi for its live state; the get_state response carries the current
+  " model, which PiChatStatusModel() renders on the right of the statusline.
+  call s:Send({'type': 'get_state'})
+
   if s:fresh
     call s:AddLogLines(['', 'pi chat — <CR> sends · <C-CR> newline · <C-c> abort'])
     if !empty(g:pi_chat_master_prompt)
@@ -1365,19 +1417,6 @@ function! s:PiAbort()
   call s:AddLogLines(['', '⚠ abort requested'])
   call s:HideWorking()
   call s:SetStatus('aborted')
-endfunction
-
-" Expects `provider/model-id` (e.g. anthropic/claude-sonnet-4-5); the RPC
-" set_model command takes the two parts as separate fields.
-function! s:PiModel(pattern)
-  let l:parts = split(a:pattern, '/')
-  if len(l:parts) != 2 || empty(l:parts[0]) || empty(l:parts[1])
-    echohl ErrorMsg
-    echomsg 'pi-chat: :PiModel expects provider/model-id, e.g. anthropic/claude-sonnet-4-5'
-    echohl None
-    return
-  endif
-  call s:Send({'type': 'set_model', 'provider': l:parts[0], 'modelId': l:parts[1]})
 endfunction
 
 " Fires on every BufEnter, and is also called directly by s:PanelGuard after
@@ -1645,6 +1684,29 @@ function! s:PiClear()
   call s:SetStatus('new session')
 endfunction
 
+function! s:PiRestart()
+  " Restart the pi process in place and resume the SAME session: the session
+  " JSONL and the on-screen transcript are kept, only the process state is
+  " rebuilt.  Use after changing g:pi_chat_args (or pi's own config /
+  " extensions) without losing the conversation, and as recovery for a wedged
+  " or already-exited process (a dead s:job is fine: StopJob skips the kill).
+  " s:clear_new_session stays 0, so StartJob's create-or-resume picks the id
+  " back up instead of wiping it; s:fresh stays 0, so the transcript and any
+  " half-typed prompt are preserved.  Note: this does NOT re-read this
+  " plugin's vimscript — restart vim for that.
+  if s:buf < 1
+    echohl WarningMsg
+    echomsg 'pi chat: no chat open (use :PiOpen)'
+    echohl None
+    return
+  endif
+  call s:StopJob()
+  let s:clear_new_session = 0
+  let s:fresh = 0
+  call s:StartJob()
+  call s:AddLogLines(['↻ pi process restarted (session resumed)'])
+endfunction
+
 function! s:PiClose(...)
   call s:ThinkCloseAll()
   if a:0 > 0 && a:1
@@ -1803,7 +1865,9 @@ endfunction
 function! s:BufSetup()
   setlocal buftype=nofile bufhidden=hide noswapfile nonumber norelativenumber nospell
   setlocal wrap linebreak cursorline foldcolumn=0
-  setlocal statusline=%{PiChatStatusText()}
+  " '%=' floats everything after it to the right, so the model label sits at
+  " the right edge next to the status text ('pi chat' / 'pi is working').
+  setlocal statusline=%<%{PiChatStatusText()}%=%{PiChatStatusModel()}
 
   syn match PiChatUser    '^❯.*'
   syn match PiChatTool    '^  ⚙.*'
@@ -1985,7 +2049,7 @@ function! s:DrainQueue()
   endfor
 
   if l:sticky
-    call s:GotoInput()
+    call s:StickToInput()
   endif
 endfunction
 
@@ -2001,6 +2065,41 @@ function! s:CursorOnInputLine()
     return 0
   endif
   return win_getid() == l:win && line('.') >= s:input_line
+endfunction
+
+" Re-anchor the user's cursor after the drain tick edited the log region
+" while the cursor sat on the prompt block. Inserting lines ABOVE the cursor
+" shifts it automatically, so the common case needs nothing at all — and
+" s:GotoInput() must not run here: it would reset the column to just past
+" the ❯, yanking the cursor back to the start of the line mid-sentence on
+" every notification or tool line that lands while the user is typing.
+" Correct the cursor only when it was actually displaced:
+"  - it sat in the log region (its line got absorbed) -> back to the prompt;
+"  - it sits on the prompt line in front of the ❯ marker -> behind it.
+" The second case is what a finished turn leaves behind: the glyph is blanked
+" while pi works (the cursor clamps to byte col 1) and s:HideWorking() puts
+" the '❯ ' prefix back, but nothing else ever moves a col-1 cursor —
+" s:PinInputCursor only fires in insert mode, and the turn ends while the
+" user is in normal mode. The user can never intend to rest in front of the
+" marker (s:PinInputCursor forbids it), so re-anchoring is always safe.
+function! s:StickToInput()
+  if s:buf < 1 || !buflisted(s:buf) || s:input_line < 1
+    return
+  endif
+  let l:win = s:FindWin()
+  if l:win < 1 || win_getid() != l:win
+    return
+  endif
+  if line('.') < s:input_line
+    call cursor(s:input_line, s:InputCol(s:input_line))
+    return
+  endif
+  if line('.') == s:input_line
+    let l:min = s:InputCol(s:input_line)
+    if col('.') < l:min
+      call cursor(s:input_line, l:min)
+    endif
+  endif
 endfunction
 
 " Appends log lines above the input line (and above the tail line when a
@@ -2020,13 +2119,36 @@ function! s:AddLogLines(lines)
   if empty(l:flat)
     return
   endif
-  let l:n = len(l:flat)
+  " Collapse blank-line runs to a single blank line: model text routinely
+  " ends in a trailing \n (sometimes \n\n) and multi-line payloads (notifies,
+  " resumed transcripts) carry their own blanks, so without this a
+  " reply-to-tool gap balloons to several empty lines. A lone trailing blank
+  " (the turn separator) survives.
+  let l:clean = []
+  for l:line in l:flat
+    if l:line ==# '' && !empty(l:clean) && l:clean[-1] ==# ''
+      continue
+    endif
+    call add(l:clean, l:line)
+  endfor
+  " If the line the block would land right below is already blank, drop
+  " leading blanks too (they would just extend the same separator).
+  let l:at = s:tail_line > 0 ? s:tail_line - 1 : s:input_line - 1
+  if l:at >= 1 && getline(l:at) ==# ''
+    while !empty(l:clean) && l:clean[0] ==# ''
+      call remove(l:clean, 0)
+    endwhile
+  endif
+  if empty(l:clean)
+    return
+  endif
+  let l:n = len(l:clean)
   if s:tail_line > 0
-    call append(s:tail_line - 1, l:flat)
+    call append(s:tail_line - 1, l:clean)
     let s:input_line += l:n
     let s:tail_line += l:n
   else
-    call append(s:input_line - 1, l:flat)
+    call append(s:input_line - 1, l:clean)
     let s:input_line += l:n
   endif
   call s:CaptureTranscript()
@@ -2077,6 +2199,19 @@ function! s:CommitTail()
   let s:tail = ''
   let s:tail_line = 0
   if l:had_line > 0
+    if getline(l:had_line) ==# ''
+      " The message text ended in a newline: the tail line is just an empty
+      " placeholder. If the line above it is already blank (the model's
+      " trailing \n\n), drop the placeholder so the gap stays a single
+      " separator line; otherwise the placeholder itself is the separator
+      " and it stays.
+      if l:had_line > 1 && getline(l:had_line - 1) ==# ''
+        call deletebufline(s:buf, l:had_line)
+        let s:input_line -= 1
+        call s:CaptureTranscript()
+      endif
+      return
+    endif
     " The remainder already sits on the tail line; just end the turn.
     call s:AddLogLines([''])
   elseif l:rest ==# ''
@@ -2094,6 +2229,18 @@ function! s:HandleEvent(msg)
   if l:t ==# 'response'
     if get(a:msg, 'success', v:true) != v:true
       call s:AddLogLines(['', '⚠ ' . get(a:msg, 'error', 'command failed')])
+    else
+      " Statusline model label: only set from pi-confirmed responses
+      " (a failed set_model leaves it unchanged). Model changes are done
+      " on the pi side (e.g. pi's own /model); this plugin only displays.
+      let l:cmd = get(a:msg, 'command', '')
+      let l:data = get(a:msg, 'data', {})
+      if l:cmd ==# 'get_state' || l:cmd ==# 'set_model' || l:cmd ==# 'cycle_model'
+        let l:m = s:ModelObject(l:data)
+        if !empty(l:m)
+          call s:SetModelLabel(s:ModelLabelOf(l:m))
+        endif
+      endif
     endif
     return
   endif
