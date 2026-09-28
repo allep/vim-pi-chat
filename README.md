@@ -28,7 +28,9 @@ line, events come back as one JSON object per line. The plugin:
 - buffers stdout lines and drains them on a `timer_start` tick, so output
   never interrupts you mid-keystroke;
 - renders `text_delta` deltas incrementally (line-buffered), tool executions
-  as `⚙ …` / `✓ …` / `✗ …` lines, and your prompts as `❯ …`;
+  as `⚙ …` / `✓ …` / `✗ …` lines, and your prompts as `❯ …`; `edit` and
+  `write` tool calls additionally get a syntax-highlighted diff preview in
+  the same format as pi's TUI (`g:pi_chat_tool_diff`);
 - answers extension UI requests: `notify` renders as an in-chat transcript
   line with a level marker (ℹ/⚠/⛔), `confirm`/`select`/`input` use native Vim
   dialogs, and `editor` opens a scratch buffer.
@@ -163,6 +165,8 @@ let g:pi_chat_context_file = 1          " 1 = inject the context file into promp
 let g:pi_chat_track_files = 1           " 1 = re-key pi's context when you switch files (:e, :b, …)
 let g:pi_chat_master_prompt = ''        " file path (or inline text) of standing rules, appended to pi's system prompt
 let g:pi_chat_autosave_context = 0      " 1 = save the context file before each send (else prompt)
+let g:pi_chat_tool_diff = 1             " 1 = show a diff preview for pi's edit/write tool calls
+let g:pi_chat_tool_diff_max = 200       " cap diff previews at N lines (0 = unlimited)
 let g:pi_chat_run_timeout = 300         " 0 = off; N = warn if a run is still busy after N seconds
 let g:pi_chat_session_resume = 1        " 1 = :PiOpen resumes the file's (or folder's) pi conversation
 let g:pi_chat_session_fallback_dir = 1  " 1 = fall back to the file's folder session when no file session exists

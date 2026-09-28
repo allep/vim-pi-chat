@@ -100,12 +100,21 @@ process.stdin.on('data', (chunk) => {
             const args =
               name === 'bash' ? { command: 'echo fake' }
               : name === 'read' ? { path: editPath }
+              : name === 'write' ? { path: editPath,
+                  content: process.env.FAKE_PI_WRITE_CONTENT || 'alpha\nGAMMA\nbeta\nzeta\neta\ntheta\n' }
               : { path: editPath };
             emit({ type: 'tool_execution_start', toolName: name, args });
             setTimeout(() => {
               emit({ type: 'tool_execution_update', toolName: name, partialResult: name + ' output\n' });
               setTimeout(() => {
-                emit({ type: 'tool_execution_end', toolName: name, isError: toolFail && name === tools[0] });
+                const end = { type: 'tool_execution_end', toolName: name, isError: toolFail && name === tools[0] };
+                if (name === 'edit') {
+                  // pi hands the TUI a pre-formatted display diff for edits.
+                  end.result = { content: [{ type: 'text', text: 'ok' }],
+                    details: { diff: process.env.FAKE_PI_DIFF || '   1 alpha\n-  2 beta\n+  2 gamma\n   3 delta',
+                               firstChangedLine: 2 } };
+                }
+                emit(end);
                 runNext();
               }, turn);
             }, turn);

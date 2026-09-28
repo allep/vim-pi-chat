@@ -89,6 +89,11 @@ if !exists('g:pi_chat_map')                  | let g:pi_chat_map = '<leader>pi' 
 if !exists('g:pi_chat_context_file')         | let g:pi_chat_context_file = 1 | endif
 if !exists('g:pi_chat_track_files')          | let g:pi_chat_track_files = 1 | endif
 if !exists('g:pi_chat_autosave_context')     | let g:pi_chat_autosave_context = 0 | endif
+" Show a pi-style diff preview for file tools (write/edit).  1 = on,
+" 0 = off (just the "✓ write"/"✓ edit" line).
+if !exists('g:pi_chat_tool_diff')           | let g:pi_chat_tool_diff = 1 | endif
+" Cap diff previews at this many lines; 0 = no cap.
+if !exists('g:pi_chat_tool_diff_max')       | let g:pi_chat_tool_diff_max = 200 | endif
 " Master prompt: a file (or inline text) of standing rules, passed to pi with
 " --append-system-prompt so every session starts with it in the system prompt.
 if !exists('g:pi_chat_master_prompt')        | let g:pi_chat_master_prompt = '' | endif
@@ -1551,6 +1556,18 @@ function! s:PiFile(path)
         \ . (s:JobAlive() ? ' (cwd applies from next :PiOpen)' : '')])
 endfunction
 
+" Resolve a tool path the way pi does: relative paths are resolved against
+" the directory of the file the chat was opened from (or the cwd if none).
+function! s:AbsToolPath(path)
+  if a:path[0] !=# '/' && a:path !~? '^[A-Za-z]:[/\\]'
+    let l:base = (s:context_file !=# '' && isdirectory(fnamemodify(s:context_file, ':h')))
+          \   ? fnamemodify(s:context_file, ':h')
+          \   : getcwd()
+    return fnamemodify(l:base . '/' . a:path, ':p')
+  endif
+  return fnamemodify(a:path, ':p')
+endfunction
+
 " pi's edit/write tool just wrote a file on disk. If that file is open in a
 " buffer, pull the new content in so the user sees the change live. Relative
 " paths resolve against pi's cwd (the context file's directory). Never clobbers
@@ -1559,15 +1576,7 @@ function! s:ReloadFile(path)
   if empty(a:path)
     return
   endif
-  " Resolve a relative path against pi's working directory.
-  if a:path[0] !=# '/' && a:path !~? '^[A-Za-z]:[/\\]'
-    let l:base = (s:context_file !=# '' && isdirectory(fnamemodify(s:context_file, ':h')))
-          \   ? fnamemodify(s:context_file, ':h')
-          \   : getcwd()
-    let l:fn = fnamemodify(l:base . '/' . a:path, ':p')
-  else
-    let l:fn = fnamemodify(a:path, ':p')
-  endif
+  let l:fn = s:AbsToolPath(a:path)
   if !filereadable(l:fn)
     return
   endif
@@ -1587,6 +1596,99 @@ function! s:ReloadFile(path)
   " setbufline() marks the buffer modified; it now matches disk, so clear it.
   call setbufvar(l:b, '&modified', 0)
   call s:Notify('reloaded ' . fnamemodify(l:fn, ':t') . ' (pi edited it)')
+endfunction
+
+" Build a pi-style display diff (the same format the edit tool returns in
+" result.details.diff, see pi edit-diff.js) for a whole-file replacement.
+" O(n): common prefix/suffix lines are shown as context, everything between
+" as removed + added.  Line format (unindented; s:DiffBlock adds the indent):
+"   ' N text'  context (new-file line number)
+"   '-N text'  removed (old-file line number)
+"   '+N text'  added (new-file line number)
+"   '    ...'  skipped run
+function! s:DiffFormat(old, new)
+  let l:no = len(a:old)
+  let l:nn = len(a:new)
+  let l:ctx = 4
+  let l:w = len(string(l:no > l:nn ? l:no : l:nn))
+  " Common prefix.
+  let l:p = 0
+  while l:p < l:no && l:p < l:nn && a:old[l:p] ==# a:new[l:p]
+    let l:p += 1
+  endwhile
+  " Common suffix (kept away from the prefix).
+  let l:s = 0
+  while l:s < l:no - l:p && l:s < l:nn - l:p
+        \ && a:old[l:no - 1 - l:s] ==# a:new[l:nn - 1 - l:s]
+    let l:s += 1
+  endwhile
+  let l:del = (l:no - l:s > l:p) ? a:old[l:p : l:no - l:s - 1] : []
+  let l:add = (l:nn - l:s > l:p) ? a:new[l:p : l:nn - l:s - 1] : []
+  if empty(l:del) && empty(l:add)
+    return []
+  endif
+  let l:out = []
+  " Head context: the last l:ctx lines of the common prefix (new numbering).
+  let l:h0 = (l:p > l:ctx) ? l:p - l:ctx : 0
+  if l:h0 > 0
+    call add(l:out, ' ' . printf('%*s', l:w, '') . ' ...')
+  endif
+  let l:num = l:h0 + 1
+  for l:i in range(l:h0, l:p - 1)
+    call add(l:out, ' ' . printf('%*s', l:w, l:i + 1) . ' ' . a:new[l:i])
+  endfor
+  " Removed lines (old numbering), then added lines (new numbering).
+  for l:i in range(l:p, l:no - l:s - 1)
+    call add(l:out, '-' . printf('%*s', l:w, l:i + 1) . ' ' . a:old[l:i])
+  endfor
+  let l:num = l:p + 1
+  for l:i in range(l:p, l:nn - l:s - 1)
+    call add(l:out, '+' . printf('%*s', l:w, l:num) . ' ' . a:new[l:i])
+    let l:num += 1
+  endfor
+  " Tail context: the first l:ctx lines of the common suffix (new numbering).
+  for l:i in range(0, min([l:ctx, l:s]) - 1)
+    call add(l:out, ' ' . printf('%*s', l:w, l:num) . ' ' . a:new[l:nn - l:s + l:i])
+    let l:num += 1
+  endfor
+  if l:s > l:ctx
+    call add(l:out, ' ' . printf('%*s', l:w, '') . ' ...')
+  endif
+  return l:out
+endfunction
+
+" Indent a diff block for the log buffer, capping it at
+" g:pi_chat_tool_diff_max lines with a trailing notice.
+function! s:DiffBlock(lines)
+  let l:max = get(g:, 'pi_chat_tool_diff_max', 200)
+  let l:cut = l:max > 0 && len(a:lines) > l:max
+  let l:out = map(copy(l:cut ? a:lines[:l:max - 1] : a:lines), '"  " . v:val')
+  if l:cut
+    call add(l:out, '  … ' . (len(a:lines) - l:max) . ' more lines')
+  endif
+  return l:out
+endfunction
+
+" Diff preview for the write tool: pi does not compute one for writes, so
+" diff the current on-disk content against the incoming content and format
+" it like pi's edit diff.  At tool start the on-disk file still holds the
+" pre-write content, which is exactly what we want.
+function! s:WriteDiff(path, content)
+  let l:new = split(a:content, "\n", 1)
+  if !empty(l:new) && l:new[-1] ==# ''
+    let l:new = l:new[:-2]
+  endif
+  let l:old = []
+  if a:path !=# ''
+    let l:fn = s:AbsToolPath(a:path)
+    if filereadable(l:fn) && !isdirectory(l:fn) && getfsize(l:fn) < 2 * 1024 * 1024
+      let l:old = readfile(l:fn)
+    endif
+  endif
+  let l:block = s:DiffBlock(s:DiffFormat(l:old, l:new))
+  if !empty(l:block)
+    call s:AddLogLines(l:block)
+  endif
 endfunction
 
 " Before we tell pi to work on the context file, make sure the buffer we'll
@@ -1887,6 +1989,17 @@ function! s:BufSetup()
   hi def link PiChatNoticeInfo  Comment
   hi def link PiChatNoticeError ErrorMsg
   hi def link PiChatHint        NonText
+  " Diff previews for file tools (s:DiffFormat / pi's edit-diff format; see
+  " s:WriteDiff and the tool_execution_end handler).  Defined after the
+  " markdown rules below so they win per byte on the +/− prefixes.
+  syn match PiChatDiffAdd  '^  +.*'
+  syn match PiChatDiffDel  '^  -.*'
+  syn match PiChatDiffCtx  '^ \{2}\s\+\d\+\(\s.*\)\?\|^  \d\+\s*$\|^ \{2}\s\+\.\.\.\s*$'
+  syn match PiChatDiffMore '^  ….*'
+  hi def link PiChatDiffAdd  DiffAdd
+  hi def link PiChatDiffDel  DiffDelete
+  hi def link PiChatDiffCtx  NonText
+  hi def link PiChatDiffMore NonText
   call s:ApplyMarkdown()
 
   " The transcript stays modifiable (programmatic :append/setline fail under
@@ -2276,11 +2389,32 @@ function! s:HandleEvent(msg)
       let l:detail = '  ⚙ ' . l:name
     endif
     call s:AddLogLines([l:detail])
+    " write: the full new content is in the args, so preview the diff now
+    " (pi does not compute one for writes).
+    if l:name ==# 'write' && get(g:, 'pi_chat_tool_diff', 1)
+          \ && has_key(l:args, 'path')
+          \ && !empty(get(l:args, 'content', ''))
+      call s:WriteDiff(l:args.path, l:args.content)
+    endif
   elseif l:t ==# 'tool_execution_end'
     let l:tname = get(a:msg, 'toolName', 'tool')
     if get(a:msg, 'isError', v:false)
       call s:AddLogLines(['  ✗ ' . get(a:msg, 'toolName', 'tool') . ' failed'])
     else
+      " pi hands us a ready-to-display diff for edits in result.details.diff
+      " (same format as s:DiffFormat, so the same highlight rules apply).
+      " Fake servers and older pi versions may not send it: just show the ✓.
+      if l:tname ==# 'edit' && get(g:, 'pi_chat_tool_diff', 1)
+        let l:res = get(a:msg, 'result', {})
+        let l:d = (type(l:res) == v:t_dict) ? get(l:res, 'details', {}) : {}
+        let l:diff = (type(l:d) == v:t_dict) ? get(l:d, 'diff', '') : ''
+        if type(l:diff) == v:t_string && l:diff !=# ''
+          let l:block = s:DiffBlock(split(l:diff, "\n", 1))
+          if !empty(l:block)
+            call s:AddLogLines(l:block)
+          endif
+        endif
+      endif
       call s:AddLogLines(['  ✓ ' . l:tname])
       " pi's edit/write tool just wrote a file: if it's open, reload it live.
       if l:tname ==# 'edit' || l:tname ==# 'write'

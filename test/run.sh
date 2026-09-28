@@ -146,6 +146,34 @@ and then acting"
               # per-turn prompt marker keeps the thinking history visible
               check thinkpanel '──── think about it' '' '' ;;
     tools)    export FAKE_PI_THINKING= FAKE_PI_TOOL=multi; run tools 13;  check tools '✓ edit' '' '' ;;
+    diffedit)  export FAKE_PI_THINKING= FAKE_PI_TOOL=edit FAKE_PI_EDIT_PATH=/tmp/t-diffedit-ctx.txt
+               # marker strings keep the check immune to the resumed session
+               # transcript (scenarios replay the real pi session of this repo)
+               export FAKE_PI_DIFF="$(printf '   1 alpha\n-  2 zqx7k-old\n+  2 zqx7k-new\n   3 delta')"
+               run diffedit 10
+               # the fake edit carries a canned pi display diff (w=2 numbering);
+               # it must render indented above the ✓ line
+               check diffedit '    1 alpha' '' ''
+               check diffedit '  -  2 zqx7k-old' '' ''
+               check diffedit '  \+  2 zqx7k-new' '' ''
+               check diffedit '✓ edit' '' ''
+               export FAKE_PI_DIFF= ;;
+    diffwrite) export FAKE_PI_THINKING= FAKE_PI_TOOL=write FAKE_PI_EDIT_PATH=/tmp/t-diffwrite-ctx.txt
+               export FAKE_PI_WRITE_CONTENT="$(printf 'alpha\nGAMMA\nbeta\nzeta\nzqx7k-new\neta\ntheta\n')"
+               run diffwrite 12
+               # write args carry the new content; the on-disk old content
+               # (written by the scenario) must show as - lines, new as + lines
+               check diffwrite '    1 alpha' '' ''
+               check diffwrite '  -3 zqx7k-old' '' ''
+               check diffwrite '  \+5 zqx7k-new' '' ''
+               check diffwrite '✓ write' '' ''
+               export FAKE_PI_WRITE_CONTENT= ;;
+    diffoff)   export FAKE_PI_THINKING= FAKE_PI_TOOL=multi FAKE_PI_EDIT_PATH=/tmp/t-diffedit-ctx.txt
+               export FAKE_PI_DIFF="$(printf '   1 alpha\n-  2 zqx7k-old\n+  2 zqx7k-new\n   3 delta')"
+               run diffoff 15
+               # g:pi_chat_tool_diff=0: the edit still completes but no diff
+               check diffoff '✓ edit' '  -  2 zqx7k-old' ''
+               export FAKE_PI_DIFF= FAKE_PI_EDIT_PATH= ;;
     multi)    export FAKE_PI_THINKING= FAKE_PI_TOOL=;     run multi 10;  check multi '' '' 'Echo:' ;;
     markdown) export FAKE_PI_THINKING= FAKE_PI_TOOL=
               run markdown 6
