@@ -69,6 +69,7 @@ Requirements:
 | `:PiSend <text>` | send a prompt (no text: jump to the chat and start typing) |
 | `:PiAbort` | abort the current run (`{"type":"abort"}`) |
 | `:PiClear` | start a fresh session (restarting the agent process with a new session id, so extensions never see a replaced session) |
+| `:PiRestart` | re-launch the pi process in place, resuming the same session (transcript and context kept) |
 | `:PiThinking` | toggle a small read-only panel below the chat (opened automatically with `:PiOpen`) streaming the model's thinking live, auto-scrolled to the newest line (height: `g:pi_chat_thinking_height`). Thoughts accumulate even while hidden, under a `──── prompt` marker per turn, so opening it later shows past thinking; `:PiClear` / `:PiClose` wipe it |
 | `:PiClose` | stop the agent and close (tear down) the chat |
 | `:PiFile [path]` | show or set the context file (see below) |
@@ -81,7 +82,7 @@ is ignored (the prompt glyph is hidden and the input line is blanked — you
 see an in-chat `⏳ pi is working…` line instead — and the statusline
 spinner shows pi is working). The statusline also shows the current model
 (pi reports it via `get_state` / `set_model` / `cycle_model`); model
-changes are made from the pi side (e.g. pi's own `/model`), not from Vim. — to queue a message explicitly while it is
+changes are made from the pi side (e.g. pi's own `/model`), not from Vim. To queue a message explicitly while it is
 busy, use `:PiSend <text>` (handled per `g:pi_chat_streaming_behavior`).
 
 Window switching is non-destructive: closing the chat window (or leaving it
@@ -109,7 +110,7 @@ you were viewing when `:PiOpen` started the session — if that was a bare
 scratch buffer (plain `vim`), it falls back at send time to the buffer you
 last had open (Vim's alternate buffer, `#`). Every prompt you send is
 transparently prefixed with `The file I am working on is: <abs path>
-(read it with your read tool; edit it in place when asked)` (shown
+(read it if you need its contents; edit it in place when asked)` (shown
 in the transcript as the bare `❯ text` you typed), and the pi job runs with
 that file's directory as its working directory. Override it at any time with
 `:PiFile <path>` (no argument prints the current one; changing it mid-session
@@ -126,7 +127,7 @@ background (the plugin forces a full redraw after reloading, since vim may
 otherwise not repaint a non-current window until your next keystroke). This
 covers the edit/write tools, and — because the plugin snapshots the file's
 `[mtime, size]` around every tool call — *any* tool that rewrites the file
-(a `bash` `sed` included), logged as `↻ reloaded TODO (changed on disk)`.
+(a `bash` `sed` included), logged as `ℹ reloaded TODO (changed on disk)`.
 If the buffer has unsaved changes of your own, the reload is skipped with a
 notification and a `:e!` hint, so it never clobbers your in-progress edits.
 
@@ -260,7 +261,8 @@ a fresh session starts. Changes take effect when the pi job restarts (e.g.
 
 `g:pi_chat_autosave_context` controls what happens when you send a prompt with
 unsaved changes in the context file: `1` saves it to disk first (so pi edits
-the file on disk); `0` (default) prompts you to save or cancel before sending.
+the file on disk); `0` (default) prompts you first — save the changes, or
+let pi edit the on-disk version.
 
 `g:pi_chat_session_resume` (default `1`) makes `:PiOpen` resume the pi
 conversation for the context file, falling back to its folder's conversation
@@ -295,8 +297,9 @@ Run the whole end-to-end suite (the basic E2E plus the scenarios in
 `test/scenarios/`: `abort`, `abortreplay`, `abortresume`, `abortdeath`,
 `blankgap`, `clear`, `close`, `cursorprompt`, `fail`, `leak`, `markdown`,
 `modelstatus`, `multi`, `nosession`, `notify`, `notifycursor`, `panelguard`,
-`pifile`, `pifilecmd`, `pisend`, `restart`, `resume`, `resumethink`, `think`,
-`thinkoff`, `thinkpanel`, `tools`, `trackfile`, `working`) from the repo root.
+`pifile`, `pifilecmd`, `pisend`, `reload`, `restart`, `resume`, `resumethink`,
+`think`, `thinkoff`, `thinkpanel`, `tools`, `trackfile`, `working`, `diffedit`,
+`diffoff`, `diffwrite`, `diskchg`) from the repo root.
 The `abortreplay` scenario replays a captured real-pi session byte-for-byte
 (`test/replay/`). The `stall` watchdog scenario is
 manual-only (a slow fake triggers a headless hit-enter barrier):
