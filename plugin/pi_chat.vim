@@ -165,6 +165,14 @@ let s:tail = ''
 " file the user has loaded.
 let s:cur_tool_path = ''
 
+" [mtime, size] of the context file at the start of the current tool.  If
+" either differs at tool_execution_end and the tool was not edit/write
+" (those already reload), *something* (e.g. a bash sed) rewrote the file,
+" so reload the open buffer the same way.  Size disambiguates edits that
+" land in the same wall-clock second as the snapshot (getftime is
+" second-granular).
+let s:ctx_stat = [-1, -1]
+
 let s:running = 0
 let s:queue = []
 let s:drain_timer = ''
@@ -1572,10 +1580,13 @@ endfunction
 " buffer, pull the new content in so the user sees the change live. Relative
 " paths resolve against pi's cwd (the context file's directory). Never clobbers
 " a buffer holding unsaved local edits - that case is flagged instead.
-function! s:ReloadFile(path)
+function! s:ReloadFile(path, ...)
   if empty(a:path)
     return
   endif
+  " Why the file changed: 'pi edited it' (edit/write tool, the default)
+  " or 'changed on disk' (another tool, e.g. bash, rewrote it).
+  let l:reason = a:0 ? a:1 : 'pi edited it'
   let l:fn = s:AbsToolPath(a:path)
   if !filereadable(l:fn)
     return
@@ -1587,15 +1598,28 @@ function! s:ReloadFile(path)
   endif
   " Don't clobber local edits the user made in this buffer.
   if getbufvar(l:b, '&modified')
-    call s:Notify('pi edited ' . fnamemodify(l:fn, ':t')
+    call s:Notify(fnamemodify(l:fn, ':t') . ' ' . l:reason
           \ . ' - you have unsaved changes; :e! to reload its content')
     return
   endif
   " Push the on-disk content into the buffer without switching windows.
-  call setbufline(l:b, 1, readfile(l:fn))
+  " setbufline() with a List only overwrites from line 1: when the file
+  " shrank, old trailing lines survive (this build has no range setline nor
+  " buflinecount()), so delete the old tail first, then write the new lines.
+  let l:new = readfile(l:fn)
+  let l:old = len(getbufline(l:b, 1, '$'))
+  if l:old > 1
+    call deletebufline(l:b, 2, l:old)
+  endif
+  call setbufline(l:b, 1, empty(l:new) ? [''] : l:new)
   " setbufline() marks the buffer modified; it now matches disk, so clear it.
   call setbufvar(l:b, '&modified', 0)
-  call s:Notify('reloaded ' . fnamemodify(l:fn, ':t') . ' (pi edited it)')
+  call s:Notify('reloaded ' . fnamemodify(l:fn, ':t') . ' (' . l:reason . ')')
+  " Force a repaint: the reloaded window is usually the one in the
+  " background while the user sits in the chat panel, and vim may not
+  " refresh its screen area until the next keystroke.  Without this the
+  " new content lags behind the 'reloaded ...' notice by exactly that.
+  redraw
 endfunction
 
 " Build a pi-style display diff (the same format the edit tool returns in
@@ -2380,6 +2404,10 @@ function! s:HandleEvent(msg)
     let l:args = get(a:msg, 'args', {})
     " Remember which file this tool targets so we can live-reload it on end.
     let s:cur_tool_path = get(l:args, 'path', get(l:args, 'file_path', ''))
+    " Snapshot the context file's [mtime, size] so tool_execution_end can
+    " detect a tool other than edit/write (e.g. bash) rewriting it.
+    let s:ctx_stat = (s:context_file !=# '' && filereadable(s:context_file))
+          \ ? [getftime(s:context_file), getfsize(s:context_file)] : [-1, -1]
     let l:detail = ''
     if has_key(l:args, 'command')
       let l:detail = '  ⚙ ' . l:name . '  ' . l:args.command
@@ -2419,9 +2447,16 @@ function! s:HandleEvent(msg)
       " pi's edit/write tool just wrote a file: if it's open, reload it live.
       if l:tname ==# 'edit' || l:tname ==# 'write'
         call s:ReloadFile(s:cur_tool_path)
+      elseif s:ctx_stat[0] >= 0 && s:context_file !=# ''
+        \ && filereadable(s:context_file)
+        \ && [getftime(s:context_file), getfsize(s:context_file)] !=# s:ctx_stat
+        " Some other tool (bash, ...) rewrote the context file on disk:
+        " reload the open buffer the same way so it can't lag behind.
+        call s:ReloadFile(s:context_file, 'changed on disk')
       endif
     endif
     let s:cur_tool_path = ''
+    let s:ctx_stat = [-1, -1]
   elseif l:t ==# 'extension_ui_request'
     call s:UiRequest(a:msg)
   endif

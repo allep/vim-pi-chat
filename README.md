@@ -119,10 +119,37 @@ its write tool (as long as the parent directory exists). A still-unnamed scratch
 (the job then runs in your shell's cwd). Disable with
 `g:pi_chat_context_file = 0`.
 
-When pi edits the context file (via its edit/write tool) the plugin reloads the
-buffer from disk so you see the change live. If that buffer has unsaved changes
-of your own, the reload is skipped with a notification and a `:e!` hint,
-so it never clobbers your in-progress edits.
+When pi edits the context file the plugin reloads the buffer from disk so
+you see the change live — immediately, even if that window is in the
+background (the plugin forces a full redraw after reloading, since vim may
+otherwise not repaint a non-current window until your next keystroke). This
+covers the edit/write tools, and — because the plugin snapshots the file's
+`[mtime, size]` around every tool call — *any* tool that rewrites the file
+(a `bash` `sed` included), logged as `↻ reloaded TODO (changed on disk)`.
+If the buffer has unsaved changes of your own, the reload is skipped with a
+notification and a `:e!` hint, so it never clobbers your in-progress edits.
+
+Edits that don't go through pi at all (your own shell in another terminal,
+git, another process) are vim's territory: `'autoread'` re-reads an
+unmodified buffer when vim notices the file changed, and never touches a
+buffer with unsaved changes. In a terminal vim only notices on certain
+events, so give it one:
+
+```vim
+set autoread
+set updatetime=200
+augroup AutoRead
+  autocmd!
+  autocmd CursorHold,CursorHoldI * checktime
+  autocmd FocusGained * checktime   " needs focus events (tmux: set -g focus-events on)
+augroup END
+```
+
+An unmodified buffer then refreshes within ~200ms of any external write; a
+modified one is left alone until you `:e!`. (The tempting `clientserver`
+remote-poke alternative is not available in the current MacPorts 9.2 build:
+it advertises `+clientserver` but lacks the `servername` option, like other
+shaved APIs in that build.)
 
 With `g:pi_chat_track_files` (default `1`) the context also follows your
 working file automatically: opening a different real file (`:e`, `:b`, …)

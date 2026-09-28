@@ -126,6 +126,23 @@ for f in test/scenarios/t-*.vim; do
               check pifilecmd 'context file: .*pi_chat.vim' '' '' ;;
     pisend)   export FAKE_PI_THINKING= FAKE_PI_TOOL=;     run pisend 3
               check pisend 'Echo: pi send test' '' '' ;;
+    reload)   export FAKE_PI_THINKING= FAKE_PI_TOOL=write FAKE_PI_EDIT_PATH=/tmp/t-reload-ctx.txt
+               export FAKE_PI_WRITE_CONTENT="$(printf 'alpha\nzqx7k-new\nbeta\n')"
+               run reload 12
+               # shrank 5 -> 3 lines: the open buffer must show exactly the new
+               # content (old tail lines gone) and not be left modified
+               check reload 'BUF\[alpha\|zqx7k-new\|beta\] MOD\[0\]' 'BUF\[.*zqx7k-old' ''
+               export FAKE_PI_WRITE_CONTENT= FAKE_PI_EDIT_PATH= ;;
+    diskchg)  export FAKE_PI_THINKING= FAKE_PI_TOOL=bash
+               # The fake really runs this command: it rewrites the tracked
+               # context file on disk from a NON edit/write tool.
+               export FAKE_PI_BASH_CMD="sed -i '' 's/zqx7k-old/zqx7k-new/' /tmp/t-diskchg-ctx.txt"
+               run diskchg 12
+               # the open buffer shows the sed'd content, unmodified, and the
+               # chat notes the external change
+               check diskchg 'reloaded t-diskchg-ctx\.txt \(changed on disk\)' 'BUF\[.*zqx7k-old' ''
+               check diskchg 'BUF\[alpha\|zqx7k-new\|beta\|delta\] MOD\[0\]' '' ''
+               export FAKE_PI_BASH_CMD= ;;
     think)    export FAKE_PI_THINKING=1 FAKE_PI_TOOL=;    run think 10;  check think 'Thinking:' '' '' ;;
     thinkoff) export FAKE_PI_THINKING=1 FAKE_PI_TOOL=;    run thinkoff 10; check thinkoff 'Echo:' 'Thinking:' '' ;;
     thinkpanel) export FAKE_PI_THINKING=1 FAKE_PI_TOOL=
@@ -159,11 +176,13 @@ and then acting"
                check diffedit '✓ edit' '' ''
                export FAKE_PI_DIFF= ;;
     diffwrite) export FAKE_PI_THINKING= FAKE_PI_TOOL=write FAKE_PI_EDIT_PATH=/tmp/t-diffwrite-ctx.txt
-               export FAKE_PI_WRITE_CONTENT="$(printf 'alpha\nGAMMA\nbeta\nzeta\nzqx7k-new\neta\ntheta\n')"
+               export FAKE_PI_WRITE_CONTENT="$(printf 'zqx7k-ctx\nGAMMA\nbeta\nzeta\nzqx7k-new\neta\ntheta\n')"
                run diffwrite 12
                # write args carry the new content; the on-disk old content
-               # (written by the scenario) must show as - lines, new as + lines
-               check diffwrite '    1 alpha' '' ''
+               # (written by the scenario) must show as - lines, new as + lines.
+               # The context line is indented 2 + ' N ' (single-digit width),
+               # hence exactly 3 leading spaces.
+               check diffwrite '   1 zqx7k-ctx' '' ''
                check diffwrite '  -3 zqx7k-old' '' ''
                check diffwrite '  \+5 zqx7k-new' '' ''
                check diffwrite '✓ write' '' ''

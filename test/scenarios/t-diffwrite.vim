@@ -6,8 +6,11 @@ set nocompatible
 set noswapfile
 let s:root = fnamemodify(resolve(expand('<sfile>:p')), ':h:h:h')
 let g:pi_chat_context_file = 0
+" Fresh session: a resumed one replays this repo's live transcript, which
+" contaminated earlier diff checks with stale lines.
+let g:pi_chat_session_resume = 0
 " Old content the fake write will replace.
-call writefile(['alpha', 'beta', 'zqx7k-old', 'delta'], '/tmp/t-diffwrite-ctx.txt')
+call writefile(['zqx7k-ctx', 'beta', 'zqx7k-old', 'delta'], '/tmp/t-diffwrite-ctx.txt')
 execute 'source ' . fnameescape(s:root . '/plugin/pi_chat.vim')
 call writefile([], '/tmp/t-diffwrite.txt')
 function! s:SendAt(ms)

@@ -97,8 +97,9 @@ process.stdin.on('data', (chunk) => {
               return;
             }
             const name = tools[i++];
+            const bashCmd = process.env.FAKE_PI_BASH_CMD || 'echo fake';
             const args =
-              name === 'bash' ? { command: 'echo fake' }
+              name === 'bash' ? { command: bashCmd }
               : name === 'read' ? { path: editPath }
               : name === 'write' ? { path: editPath,
                   content: process.env.FAKE_PI_WRITE_CONTENT || 'alpha\nGAMMA\nbeta\nzeta\neta\ntheta\n' }
@@ -107,6 +108,17 @@ process.stdin.on('data', (chunk) => {
             setTimeout(() => {
               emit({ type: 'tool_execution_update', toolName: name, partialResult: name + ' output\n' });
               setTimeout(() => {
+                if (name === 'write') {
+                  // Behave like real pi: put the new content on disk before
+                  // announcing the end, so the plugin's live reload has it.
+                  require('fs').writeFileSync(editPath, args.content);
+                }
+                if (name === 'bash' && process.env.FAKE_PI_BASH_CMD) {
+                  // Same deal for bash: really run the command before
+                  // announcing the end (the plugin can then reload any file
+                  // it rewrote).
+                  require('child_process').execSync(bashCmd, { stdio: 'ignore' });
+                }
                 const end = { type: 'tool_execution_end', toolName: name, isError: toolFail && name === tools[0] };
                 if (name === 'edit') {
                   // pi hands the TUI a pre-formatted display diff for edits.

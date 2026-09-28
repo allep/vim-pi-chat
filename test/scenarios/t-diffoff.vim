@@ -6,6 +6,7 @@ set noswapfile
 let s:root = fnamemodify(resolve(expand('<sfile>:p')), ':h:h:h')
 let g:pi_chat_context_file = 0
 let g:pi_chat_tool_diff = 0
+let g:pi_chat_session_resume = 0
 execute 'source ' . fnameescape(s:root . '/plugin/pi_chat.vim')
 call writefile([], '/tmp/t-diffoff.txt')
 function! s:SendAt(ms)
