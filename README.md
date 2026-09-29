@@ -1,8 +1,9 @@
 # vim-pi-chat
 
 A chat window for the [pi coding agent](https://github.com/earendil-works/pi)
-inside classic Vim (no GUI, no nvim, no Node.js runtime needed by Vim itself —
-it just speaks to the `pi` CLI).
+inside Vim 9 (no GUI, no Node.js runtime needed by Vim itself — it just
+speaks to the `pi` CLI). Neovim is not supported: the plugin is built on Vim's
+job/channel API.
 
 ```
 ┌────────────────────────────────────────────┬─────────────────────────────┐
@@ -21,7 +22,7 @@ it just speaks to the `pi` CLI).
 ## How it works
 
 The plugin spawns `pi --mode rpc` as a background job
-(`jobstart`/`ch_sendraw`). RPC mode is a strict JSON-lines protocol over
+(`job_start`/`ch_sendraw`). RPC mode is a strict JSON-lines protocol over
 stdin/stdout (see pi's `docs/rpc.md`): commands go in as one JSON object per
 line, events come back as one JSON object per line. The plugin:
 
@@ -32,8 +33,10 @@ line, events come back as one JSON object per line. The plugin:
   `write` tool calls additionally get a syntax-highlighted diff preview in
   the same format as pi's TUI (`g:pi_chat_tool_diff`);
 - answers extension UI requests: `notify` renders as an in-chat transcript
-  line with a level marker (ℹ/⚠/⛔), `confirm`/`select`/`input` use native Vim
-  dialogs, and `editor` opens a scratch buffer.
+  line with a level marker (ℹ/⚠/⛔), and `confirm`/`select`/`input` use native
+  Vim dialogs (dismissing a `select` list with Esc sends a cancellation, never
+  a choice). `editor` requests are currently answered as cancelled (see
+  Limitations).
 
 The conversation buffer is a plain text buffer. Everything is the transcript
 except the `❯` prompt block at the bottom: type there, `<CR>` sends, and
@@ -49,13 +52,13 @@ git clone https://github.com/galeone/vim-pi-chat ~/.vim/pack/plugins/start/vim-p
 ```
 
 (or any path under `pack/*/start`, a pathogen/tp plugin dir, or drop
-`plugin/pi_chat.vim` in your runtimepath; with a plugin manager you can add
-`Plug 'galeone/vim-pi-chat'` / `use 'galeone/vim-pi-chat'` / add to your
-`vim.plug` block as usual)
+`plugin/pi_chat.vim` in your runtimepath; with a plugin manager add e.g.
+`Plug 'galeone/vim-pi-chat'` as usual)
 
 Requirements:
 
-- Vim **8.2+** compiled with `+job +channel` (`vim --version | grep job`)
+- Vim **9.0+** compiled with `+job +channel` (`vim --version | grep job`);
+  Neovim is not supported
 - the `pi` CLI installed and on `$PATH`
 - `pi auth` done beforehand (the plugin never handles credentials)
 
@@ -66,16 +69,16 @@ Requirements:
 | `:PiOpen` | open the chat **and** the thinking panel (chat in a vertical split on the right by default) |
 | `:PiOpen <message>` | open (chat + thinking) and immediately send `<message>` |
 | `:PiOpen quiet` | open (chat + thinking) without moving the cursor to the prompt (no focus steal, no insert mode) — used by the VimEnter boot hook so stray startup input can never be sent to the agent |
-| `:PiSend <text>` | send a prompt (no text: jump to the chat and start typing) |
+| `:PiSend <text>` | send a prompt to the running agent (no text: jump to the chat prompt); while pi is busy it is queued per `g:pi_chat_streaming_behavior`. Errors if the agent is not running (use `:PiOpen` first) |
 | `:PiAbort` | abort the current run (`{"type":"abort"}`) |
-| `:PiClear` | start a fresh session (restarting the agent process with a new session id, so extensions never see a replaced session) |
+| `:PiClear` | start a fresh session: restarts the agent process (so extensions never see a replaced session) and **deletes the context's own saved session** from pi's store, reusing the same context-keyed session id. A folder conversation the file had only inherited is left untouched: the file gets its own fresh session |
 | `:PiRestart` | re-launch the pi process in place, resuming the same session (transcript and context kept) |
 | `:PiThinking` | toggle a small read-only panel below the chat (opened automatically with `:PiOpen`) streaming the model's thinking live, auto-scrolled to the newest line (height: `g:pi_chat_thinking_height`). Thoughts accumulate even while hidden, under a `──── prompt` marker per turn, so opening it later shows past thinking; `:PiClear` / `:PiClose` wipe it |
 | `:PiClose` | stop the agent and close (tear down) the chat |
 | `:PiFile [path]` | show or set the context file (see below) |
 | `<leader>pi` | `:PiOpen` (default mapping, set `g:pi_chat_map` to change) |
 
-In the chat buffer: `A` (or `i`) jumps to the `❯` prompt and enters insert
+In the chat buffer (buffer-local mappings): `A` (or `i`) jumps to the `❯` prompt and enters insert
 mode, `<CR>` sends (multi-line: continuation lines are joined), and `<C-c>`
 aborts the current run. While pi is generating a turn, typing on the prompt
 is ignored (the prompt glyph is hidden and the input line is blanked — you
@@ -114,7 +117,8 @@ transparently prefixed with `The file I am working on is: <abs path>
 in the transcript as the bare `❯ text` you typed), and the pi job runs with
 that file's directory as its working directory. Override it at any time with
 `:PiFile <path>` (no argument prints the current one; changing it mid-session
-applies to new prompts, the cwd change takes effect at the next `:PiOpen`).
+applies to new prompts, while the job's cwd only changes the next time the pi
+process starts: `:PiRestart`, `:PiClear`, or reopening a parked chat).
 Unsaved files work too: the path is passed with a `(not saved to disk yet;
 create it when I ask for new content)` hint, so pi can create the file with
 its write tool (as long as the parent directory exists). A still-unnamed scratch buffer gives no context file
@@ -156,15 +160,18 @@ shaved APIs in that build.)
 With `g:pi_chat_track_files` (default `1`) the context also follows your
 working file automatically: opening a different real file (`:e`, `:b`, …)
 re-keys it, and if the agent is running it is told the switch (logged in the
-chat); with it parked, the new file is used on the next `:PiOpen`. Set
+chat); with it parked, the new file is used on the next `:PiOpen`. Note that
+the notice is sent as a regular prompt, so each switch while the agent is idle
+costs one (short) model turn. Set
 `g:pi_chat_track_files = 0` to keep the context fixed until you use `:PiFile`.
 
 ### Resuming a conversation
 
 pi keeps its conversation history in its own session store. The plugin ties
 each session to *your* context so `:PiOpen` picks up where you left off instead
-of starting a fresh agent: a stable session id is derived from the context
-file's path and passed to pi with `--session-id`, so reopening the same file
+of starting a fresh agent: a stable session id (`pchat-<len>-<sha256 of the
+resolved path>`) is derived from the context file's path and passed to pi with
+`--session-id`, so reopening the same file
 resumes that file's conversation. If you never chatted about that specific file
 but did chat from its folder, `:PiOpen` falls back to the folder's conversation
 (a file you just opened inherits its folder's history); otherwise a new
@@ -174,7 +181,7 @@ working.
 
 This is on by default. `g:pi_chat_no_session` still wins and forces a
 disposable conversation. `g:pi_chat_session_resume = 0` passes no session id
-at all, and pi then applies its own default (resume most recent session).
+at all, and pi then applies its own default (a new session each time).
 The config below turns it off or tunes the fallback and how much history is
 shown.
 
@@ -218,13 +225,13 @@ There are two reasons for the exact shape:
 ## Configuration (`.vimrc`)
 
 ```vim
-let g:pi_chat_split = 'vsplit'          " 'vsplit' (default) | 'split' | 'new'
-let g:pi_chat_width = 60                " split width/height (float 0-1 = fraction of the window)
+let g:pi_chat_split = 'vsplit'          " 'vsplit' (default) | 'split' | 'new' (both horizontal)
+let g:pi_chat_width = 60                " split width/height (float 0-1 = fraction of the screen)
 let g:pi_chat_args = []                 " extra pi args, e.g. ['--model', '...']
 let g:pi_chat_no_session = 0            " 1 = pass --no-session
 let g:pi_chat_streaming_behavior = 'followUp'  " 'followUp' (default) or 'steer'
 let g:pi_chat_show_thinking = 0         " 1 = also render thinking deltas inline in the chat
-let g:pi_chat_thinking_height = 0.3     " :PiThinking panel height: float 0-1 of the window, or lines
+let g:pi_chat_thinking_height = 0.3     " :PiThinking panel height: float 0-1 of the screen height, or rows
 let g:pi_chat_markdown = 1              " 0 = disable the built-in markdown highlighting in the chat/thinking buffers
 let g:pi_chat_map = '<leader>pi'        " '' disables the global mapping
 let g:pi_chat_context_file = 1          " 1 = inject the context file into prompts
@@ -282,8 +289,13 @@ are shown on resume (`0` = the whole transcript, handy for a long-running file).
   updates stay visible without stealing focus.
 - `bash_execution_update` progress and partial tool arguments are not
   rendered (tool status lines only).
-- Extension `editor` requests open a temporary scratch buffer (`:w` saves,
-  `:q!` cancels).
+- Extension `editor` requests (multi-line text dialogs) are not supported
+  yet: they are answered as cancelled right away, with a ⚠ notice in the chat.
+- The thinking panel opens as a full-width window at the bottom of the
+  screen, not only under the chat column.
+- A resumed transcript is rebuilt from pi's session file, so your prompts show
+  up with the context prefix the plugin injected (`The file I am working on
+  is: …`) and file-switch notices appear as prompts.
 
 If the agent process dies (crash, an extension exiting, `:PiClose`), the
 panel recovers: sending to a dead agent logs `⚠ agent process is not
@@ -295,11 +307,13 @@ file). `:PiClear` always forces a brand-new session.
 
 Run the whole end-to-end suite (the basic E2E plus the scenarios in
 `test/scenarios/`: `abort`, `abortreplay`, `abortresume`, `abortdeath`,
-`blankgap`, `clear`, `close`, `cursorprompt`, `fail`, `leak`, `markdown`,
-`modelstatus`, `multi`, `nosession`, `notify`, `notifycursor`, `panelguard`,
-`pifile`, `pifilecmd`, `pisend`, `reload`, `restart`, `resume`, `resumethink`,
-`think`, `thinkoff`, `thinkpanel`, `tools`, `trackfile`, `working`, `diffedit`,
-`diffoff`, `diffwrite`, `diskchg`) from the repo root.
+`blankgap`, `clear`, `cleardir`, `clearwipe`, `close`, `closethink`, `crash`,
+`cursorprompt`, `fail`, `leak`, `markdown`, `modelstatus`, `multi`,
+`nldelta`, `nosession`, `notify`, `notifycursor`, `panelguard`, `park`,
+`pifile`, `pifilecmd`, `pisend`, `queue`, `reject`, `reload`, `restart`,
+`resume`, `resumethink`, `select`, `sessionid`, `think`, `thinkoff`,
+`thinkpanel`, `tools`, `trackfile`, `working`, `diffedit`, `diffoff`,
+`diffwrite`, `diskchg`) from the repo root.
 The `abortreplay` scenario replays a captured real-pi session byte-for-byte
 (`test/replay/`). The `stall` watchdog scenario is
 manual-only (a slow fake triggers a headless hit-enter barrier):
@@ -329,7 +343,9 @@ Notes:
   mode).
 - `test/fake-pi.js` is env-configurable (`FAKE_PI_THINKING`, `FAKE_PI_TOOL`,
   `FAKE_PI_TOOLFAIL`, `FAKE_PI_TITLE`, `FAKE_PI_DELAY_MS`, `FAKE_PI_TURN_MS`,
-  `FAKE_PI_EDIT_PATH`, …) so one stub covers every scenario; it also logs the
+  `FAKE_PI_EDIT_PATH`, `FAKE_PI_DELTAS`, `FAKE_PI_REJECT`, `FAKE_PI_CRASH_MS`,
+  `FAKE_PI_QUEUE`, `FAKE_PI_LIFE_LOG`, …; see its header) so one stub covers
+  every scenario; it also logs the
   lines it receives (`FAKE_PI_LOG`) and its launch argv (`FAKE_PI_ARGV_LOG`)
   for protocol assertions (e.g. `nosession` asserts the `--no-session`
   startup arg, `clear` asserts the `--session-id` kept across the restart).

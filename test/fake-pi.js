@@ -18,6 +18,13 @@
 //   FAKE_PI_TRAILING_NEWLINES=n  append n newline chars to the reply text
 //                          (real model text routinely ends in \n / \n\n;
 //                          used to test blank-line collapsing in the log)
+//   FAKE_PI_DELTAS=json    stream exactly these text deltas (JSON string
+//                          array) instead of one delta per character
+//   FAKE_PI_REJECT=msg     reject every prompt (response success:false)
+//   FAKE_PI_CRASH_MS=n     exit(1) n ms after agent_start, mid-turn
+//   FAKE_PI_QUEUE=1        queue prompts sent mid-turn; one agent_settled
+//                          after the queue drains (like real pi)
+//   FAKE_PI_LIFE_LOG=p     append 'start <pid>' / 'exit <pid>' lines
 //   FAKE_PI_LATE_NOTIFY_MS=n  emit one extra 'late note' notify n ms after
 //                             agent_settled (a background plugin notification
 //                             arriving after the turn, for cursor-park tests)
@@ -55,10 +62,47 @@ process.stdin.on('data', (chunk) => {
     }
     let req;
     try { req = JSON.parse(line); } catch { continue; }
+    handle(req, false);
+  }
+});
+
+// Lifecycle log (FAKE_PI_LIFE_LOG): 'start <pid>' / 'exit <pid>' lines, so a
+// test can count live processes (e.g. to catch an orphaned pi).
+if (process.env.FAKE_PI_LIFE_LOG) {
+  const life = (what) => {
+    try { require('fs').appendFileSync(process.env.FAKE_PI_LIFE_LOG, `${what} ${process.pid}\n`); } catch {}
+  };
+  life('start');
+  process.on('exit', () => life('exit'));
+  process.on('SIGTERM', () => process.exit(0));
+}
+
+// FAKE_PI_QUEUE=1: behave like real pi for prompts sent while a turn is in
+// flight - accept and queue them, run them after the current run's agent_end,
+// and emit a single agent_settled once the queue has drained.
+const QUEUE = process.env.FAKE_PI_QUEUE === '1';
+let turnActive = false;
+const pending = [];
+
+// dequeued = true when a queued prompt starts (its response was already sent).
+function handle(req, dequeued) {
     switch (req && req.type) {
       case 'prompt': {
         const m = (req.message || '').slice(0, 80);
-        emit({ id: req.id, type: 'response', command: 'prompt', success: true });
+        if (!dequeued && process.env.FAKE_PI_REJECT) {
+          // Rejected before acceptance: no run starts, no agent_settled.
+          emit({ id: req.id, type: 'response', command: 'prompt', success: false,
+                 error: process.env.FAKE_PI_REJECT });
+          break;
+        }
+        if (!dequeued) {
+          emit({ id: req.id, type: 'response', command: 'prompt', success: true });
+          if (QUEUE && turnActive) {
+            pending.push(req);
+            break;
+          }
+        }
+        turnActive = true;
         const delay = parseInt(process.env.FAKE_PI_DELAY_MS || '150', 10);
         const turn  = parseInt(process.env.FAKE_PI_TURN_MS  || '150', 10);
         const tool  = process.env.FAKE_PI_TOOL || 'bash';
@@ -71,6 +115,12 @@ process.stdin.on('data', (chunk) => {
 
         setTimeout(() => {
           emit({ type: 'agent_start' });
+          // FAKE_PI_CRASH_MS=n: die n ms into the turn (no abort, no settle).
+          const crash = parseInt(process.env.FAKE_PI_CRASH_MS || '0', 10);
+          if (crash > 0) {
+            setTimeout(() => process.exit(1), crash);
+            return;
+          }
 
           if (think) {
             emit({ type: 'message_start', message: { role: 'assistant' } });
@@ -83,13 +133,16 @@ process.stdin.on('data', (chunk) => {
           const trail = '\n'.repeat(parseInt(process.env.FAKE_PI_TRAILING_NEWLINES || '0', 10));
         const reply = `${prefix}${m}${trail}`;
           emit({ type: 'message_start', message: { role: 'assistant' } });
-          for (const c of reply) {
+          // FAKE_PI_DELTAS='["a","\\n\\nb"]': stream exactly these text deltas
+          // (default: one delta per character of the reply).
+          const deltas = process.env.FAKE_PI_DELTAS ? JSON.parse(process.env.FAKE_PI_DELTAS) : [...reply];
+          for (const c of deltas) {
             emit({ type: 'message_update', assistantMessageEvent: { type: 'text_delta', delta: c } });
           }
-          emit({ type: 'message_update', assistantMessageEvent: { type: 'text_end', content: reply } });
+          emit({ type: 'message_update', assistantMessageEvent: { type: 'text_end', content: deltas.join('') } });
           emit({ type: 'message_end', message: { role: 'assistant' } });
 
-          const tools = tool === 'multi' ? ['bash', 'read', 'edit'] : [tool];
+          const tools = tool === 'multi' ? ['bash', 'read', 'edit'] : tool === 'none' ? [] : [tool];
           let i = 0;
           const runNext = () => {
             if (i >= tools.length) {
@@ -146,6 +199,12 @@ process.stdin.on('data', (chunk) => {
               emit({ type: 'extension_ui_request', id: 'ui-4', method: 'notify', title, message: 'error note', notifyType: 'error' });
             }
             emit({ type: 'agent_end', willRetry: false });
+            if (QUEUE && pending.length) {
+              // A queued follow-up runs before pi settles.
+              handle(pending.shift(), true);
+              return;
+            }
+            turnActive = false;
             emit({ type: 'agent_settled' });
             const late = parseInt(process.env.FAKE_PI_LATE_NOTIFY_MS || '0', 10);
             if (late > 0) {
@@ -198,8 +257,7 @@ process.stdin.on('data', (chunk) => {
         }
         break;
     }
-  }
-});
+}
 process.stdin.on('end', () => process.exit(0));
 
 function emit(obj) {

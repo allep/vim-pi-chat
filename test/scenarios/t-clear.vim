@@ -14,11 +14,8 @@ let g:pi_chat_session_dir = '/tmp/t-clear-sessions'
 " the post-clear session, not this one).
 function! s:Derive(p)
   let l:p = resolve(fnamemodify(a:p, ':p'))
-  let l:hex = ''
-  for l:c in split(l:p, '\zs')
-    let l:hex .= printf('%02x', char2nr(l:c))
-  endfor
-  return printf('pchat-%d-%s', strlen(l:p), strpart(l:hex, 0, 64))
+  let l:p = len(l:p) > 1 ? substitute(l:p, '/$', '', '') : l:p
+  return printf('pchat-%d-%s', strlen(l:p), sha256(l:p))
 endfunction
 let s:pre = g:pi_chat_session_dir . '/cwd/' . s:Derive(getcwd()) . '.jsonl'
 call mkdir(fnamemodify(s:pre, ':h'), 'p')

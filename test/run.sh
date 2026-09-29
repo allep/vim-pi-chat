@@ -298,6 +298,77 @@ and then acting"
               else record restart-argv 0 "same-session restart not observed in argv log"
               fi
               export FAKE_PI_ARGV_LOG= ;;
+    nldelta)  export FAKE_PI_THINKING= FAKE_PI_TOOL=none FAKE_PI_DELTAS='["Hello","\n\nWorld"," end"]'
+              run nldelta 4
+              # a delta starting with "\n" must not re-emit the text after it
+              check nldelta '^World end$' '^World$' ''
+              check nldelta '^Hello$' '' ''
+              export FAKE_PI_DELTAS= ;;
+    reject)   export FAKE_PI_THINKING= FAKE_PI_TOOL= FAKE_PI_REJECT='No API key for provider'
+              run reject 4
+              # a rejected prompt never settles: busy state must clear anyway
+              check reject 'No API key for provider' '⏳ pi is working' ''
+              check reject 'STATUS\[pi chat\]' '' ''
+              check reject 'LAST\[❯ \]' '' ''
+              export FAKE_PI_REJECT= ;;
+    crash)    export FAKE_PI_THINKING= FAKE_PI_TOOL= FAKE_PI_CRASH_MS=200
+              run crash 4
+              # pi dies mid-turn: no stale working line, prompt restored
+              check crash 'pi exited with code 1' '⏳ pi is working' ''
+              check crash 'LAST\[❯ \]' '' ''
+              check crash 'STATUS\[agent stopped\]' '' ''
+              export FAKE_PI_CRASH_MS= ;;
+    queue)    export FAKE_PI_THINKING= FAKE_PI_TOOL=none FAKE_PI_QUEUE=1 FAKE_PI_DELAY_MS=500
+              run queue 6
+              # :PiSend mid-turn: both replies land, ONE settle clears the
+              # single working line, prompt and status are back to idle
+              check queue 'Echo: first' '⏳ pi is working' ''
+              check queue 'Echo: queued' '' ''
+              check queue 'LAST\[❯ \]' '' ''
+              check queue 'STATUS\[pi chat\]' '' ''
+              export FAKE_PI_QUEUE= FAKE_PI_DELAY_MS=300 ;;
+    park)     export FAKE_PI_THINKING= FAKE_PI_TOOL= FAKE_PI_LIFE_LOG=/tmp/t-park-life.log
+              run park 6
+              # the first close parks; each reopen runs exactly one pi
+              check park 'parked1 ALIVE=0' '' ''
+              check park 'reopened1 ALIVE=1' '' ''
+              check park 'parked2 ALIVE=0' '' ''
+              check park 'final ALIVE=1 LAUNCHES=3' '' ''
+              check park 'header-kept: 1' '' ''
+              export FAKE_PI_LIFE_LOG= ;;
+    sessionid) export FAKE_PI_THINKING= FAKE_PI_TOOL= FAKE_PI_ARGV_LOG=/tmp/t-sessionid-argv.log
+              run sessionid 4
+              check sessionid 'launches: 3' '' ''
+              check sessionid 'distinct-ab: 1' '' ''
+              check sessionid 'stable-a: 1' '' ''
+              check sessionid 'valid-ids: 1' '' ''
+              export FAKE_PI_ARGV_LOG= ;;
+    cleardir) export FAKE_PI_THINKING= FAKE_PI_TOOL= FAKE_PI_ARGV_LOG=/tmp/t-cleardir-argv.log
+              run cleardir 4
+              # :PiClear keeps the inherited folder session, re-keys the file
+              check cleardir 'resumed-dir: 1' '' ''
+              check cleardir 'clear-id-is-file: 1' '' ''
+              check cleardir 'dir-session-kept: 1' '' ''
+              export FAKE_PI_ARGV_LOG= ;;
+    clearwipe) export FAKE_PI_THINKING= FAKE_PI_TOOL=none
+              run clearwipe 5
+              # :PiClear deletes the old log instead of blanking it
+              check clearwipe 'FIRST\[pi chat: new session\]' 'BLANK MAX=[2-9]' ''
+              check clearwipe 'BLANK MAX=1' 'Echo: first turn' '' ;;
+    closethink) export FAKE_PI_THINKING=1 FAKE_PI_TOOL=none FAKE_PI_THINKING_TEXT=OLDTHOUGHT
+              run closethink 5
+              # :PiClose wipes the panel; reopening shows none of its thinking
+              # (and raises no E21 - the runner fails on any E-error)
+              check closethink 'first: OLDTHOUGHT' 'reopened: .*OLDTHOUGHT' ''
+              check closethink 'after-close listed-or-exists=0' '' ''
+              export FAKE_PI_THINKING_TEXT= ;;
+    select)   export FAKE_PI_THINKING= FAKE_PI_TOOL= FAKE_PI_LOG=/tmp/t-select-stdin.log
+              run select 4
+              # Esc cancels (never picks the first option); a pick sends its value
+              check select 'esc-cancelled: 1' '' ''
+              check select 'pick-value: Block' '' ''
+              check select 'editor-cancelled: 1' '' ''
+              export FAKE_PI_LOG= ;;
     stall)    echo "[stall] manual-only: a slow fake (FAKE_PI_DELAY_MS>1s) triggers a headless hit-enter barrier."
               echo "[stall] Verify by hand: the status line shows 'pi run exceeded Ns - may be stuck'. Scenario: test/scenarios/t-stall.vim" ;;
     resume)   export FAKE_PI_THINKING= FAKE_PI_TOOL= FAKE_PI_ARGV_LOG=/tmp/fakepi-argv.log

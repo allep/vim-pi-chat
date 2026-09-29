@@ -26,11 +26,8 @@ execute "source " . fnameescape(s:root . '/plugin/pi_chat.vim')
 " Replicate the plugin's deterministic session-id derivation (same formula).
 function! s:Sid(path) abort
   let l:p = resolve(fnamemodify(a:path, ':p'))
-  let l:hex = ''
-  for l:c in split(l:p, '\zs')
-    let l:hex .= printf('%02x', char2nr(l:c))
-  endfor
-  return printf('pchat-%d-%s', strlen(l:p), strpart(l:hex, 0, 64))
+  let l:p = len(l:p) > 1 ? substitute(l:p, '/$', '', '') : l:p
+  return printf('pchat-%d-%s', strlen(l:p), sha256(l:p))
 endfunction
 
 let s:sid = s:Sid(s:ctx)
