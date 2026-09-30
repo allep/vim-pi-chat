@@ -132,6 +132,8 @@ for f in test/scenarios/t-*.vim; do
                # shrank 5 -> 3 lines: the open buffer must show exactly the new
                # content (old tail lines gone) and not be left modified
                check reload 'BUF\[alpha\|zqx7k-new\|beta\] MOD\[0\]' 'BUF\[.*zqx7k-old' ''
+               # ... and Vim knows the new timestamp (no W11 later)
+               check reload 'STALE\[0\]' '' ''
                export FAKE_PI_WRITE_CONTENT= FAKE_PI_EDIT_PATH= ;;
     diskchg)  export FAKE_PI_THINKING= FAKE_PI_TOOL=bash
                # The fake really runs this command: it rewrites the tracked
@@ -298,6 +300,66 @@ and then acting"
               else record restart-argv 0 "same-session restart not observed in argv log"
               fi
               export FAKE_PI_ARGV_LOG= ;;
+    paralleltools) export FAKE_PI_THINKING= FAKE_PI_TOOL= FAKE_PI_PARALLEL=1
+              export FAKE_PI_EDIT_PATH=/tmp/t-paralleltools-a.txt FAKE_PI_EDIT_PATH2=/tmp/t-paralleltools-b.txt
+              run paralleltools 5
+              # overlapping tool calls: BOTH open buffers are reloaded
+              check paralleltools 'A\[parallel-A\]' 'A\[old-A\]' ''
+              check paralleltools 'B\[parallel-B\]' 'B\[old-B\]' ''
+              export FAKE_PI_PARALLEL= FAKE_PI_EDIT_PATH= FAKE_PI_EDIT_PATH2= ;;
+    resumefmt) export FAKE_PI_THINKING= FAKE_PI_TOOL=
+              run resumefmt 4
+              # replayed prompts show what was typed (prefix stripped) ...
+              check resumefmt '^CHAT ❯ first question$' 'The file I am working on\|❯ I switched' ''
+              check resumefmt '^CHAT ❯ second question$' '' ''
+              check resumefmt '^CHAT with two lines$' '' ''
+              check resumefmt 'blank-before-first: 1' '' ''
+              # ... an old bare switch notice is a log line, not a prompt ...
+              check resumefmt '^CHAT pi-chat: context file switched: /x/g\.txt$' '' ''
+              # ... and the abandoned branch stays hidden (chat and panel)
+              check resumefmt '^CHAT second answer$' 'abandoned' ''
+              check resumefmt '^PANEL ──── second question with two lines$' '' ''
+              check resumefmt '^PANEL kept thought$' '' '' ;;
+    stash)    export FAKE_PI_THINKING= FAKE_PI_TOOL=none
+              run stash 5
+              # :PiSend from a file window never touches the file ...
+              check stash 'file-intact: 1' '' ''
+              check stash 'sent-in-chat: 1' '' ''
+              # ... and the half-typed draft is back after the turn and after
+              # a park + reopen
+              check stash 'settled TAIL\[❯ draft text\|draft line two\]' '' ''
+              check stash 'reopened TAIL\[❯ draft text\|draft line two\]' '' '' ;;
+    toolout)  export FAKE_PI_THINKING= FAKE_PI_TOOL=multi FAKE_PI_EDIT_PATH=/tmp/t-toolout-ctx.txt
+              export FAKE_PI_TOOL_OUTPUT="$(printf 'out1\nout2\nout3\nout4\nout5\nout6\nout7\nout8\n')"
+              run toolout 5
+              # bash: first 5 output lines + a count of the rest; exactly one
+              # output block (read/edit output is not shown)
+              check toolout '^    │ out5$' '^    │ out6$' '' '^    │ out1$' 1
+              check toolout '^    │ … 3 more lines$' '' ''
+              export FAKE_PI_TOOL_OUTPUT= FAKE_PI_EDIT_PATH= ;;
+    tooloutfail) export FAKE_PI_THINKING= FAKE_PI_TOOL=multi FAKE_PI_TOOLFAIL=1 FAKE_PI_EDIT_PATH=/tmp/t-toolout-ctx.txt
+              export FAKE_PI_TOOL_OUTPUT="$(printf 'bash: frobnicate: command not found\n')"
+              run tooloutfail 5
+              # a failed tool shows its error output right under the ✗ line
+              check tooloutfail '✗ bash failed' '' ''
+              check tooloutfail '^    │ bash: frobnicate: command not found$' '' ''
+              export FAKE_PI_TOOL_OUTPUT= FAKE_PI_TOOLFAIL= FAKE_PI_EDIT_PATH= ;;
+    quitx)    export FAKE_PI_THINKING= FAKE_PI_TOOL=none
+              run quitx 4
+              # :x in the last real window closes the pi panels and exits Vim,
+              # after writing the file
+              check quitx '^EXITED$' 'STILL-RUNNING' ''
+              check quitx 'panels-open: 1' '' ''
+              if grep -qx 'edited then :x' /tmp/t-quitx-file.txt; then record quitx-saved 1
+              else record quitx-saved 0 ':x did not write the file'; fi ;;
+    quitkeep) export FAKE_PI_THINKING= FAKE_PI_TOOL=none
+              run quitkeep 4
+              check quitkeep 'split-q: running chat-visible=1' '' ''
+              check quitkeep 'chat-q: running chat-visible=0 file-visible=1' '' ''
+              check quitkeep 'only: running wins=1' '' '' ;;
+    quitoff)  export FAKE_PI_THINKING= FAKE_PI_TOOL=none
+              run quitoff 3
+              check quitoff 'off-q: running chat-visible=1' '' '' ;;
     nldelta)  export FAKE_PI_THINKING= FAKE_PI_TOOL=none FAKE_PI_DELTAS='["Hello","\n\nWorld"," end"]'
               run nldelta 4
               # a delta starting with "\n" must not re-emit the text after it
@@ -362,12 +424,25 @@ and then acting"
               check closethink 'first: OLDTHOUGHT' 'reopened: .*OLDTHOUGHT' ''
               check closethink 'after-close listed-or-exists=0' '' ''
               export FAKE_PI_THINKING_TEXT= ;;
-    select)   export FAKE_PI_THINKING= FAKE_PI_TOOL= FAKE_PI_LOG=/tmp/t-select-stdin.log
-              run select 4
-              # Esc cancels (never picks the first option); a pick sends its value
-              check select 'esc-cancelled: 1' '' ''
-              check select 'pick-value: Block' '' ''
-              check select 'editor-cancelled: 1' '' ''
+    dialogs)  export FAKE_PI_THINKING= FAKE_PI_TOOL= FAKE_PI_LOG=/tmp/t-dialogs-stdin.log
+              run dialogs 4
+              # replies carry the request id; Esc cancels (never picks);
+              # placeholders are hints; fire-and-forget gets no reply
+              check dialogs 'sel-esc-cancelled: 1' '' ''
+              check dialogs 'sel-pick-value: Block' '' ''
+              check dialogs 'sel-one-cancelled: 1' '' ''
+              check dialogs 'conf-yes: \{"confirmed":true\}' '' ''
+              check dialogs 'conf-no: \{"confirmed":false\}' '' ''
+              check dialogs 'conf-esc: \{"cancelled":true\}' '' ''
+              check dialogs 'conf-text: "Clear session\?\\nAll messages will be lost\."' '' ''
+              check dialogs 'in-text-value: \[abc\]' '' ''
+              check dialogs 'in-empty-value: \[\]' '' ''
+              check dialogs 'in-esc-cancelled: 1' '' ''
+              check dialogs 'editor-cancelled: 1' '' ''
+              check dialogs 'status-replied: 0' '' ''
+              check dialogs 'status-shown: 1' '' ''
+              check dialogs 'status-cleared: 1' '' ''
+              check dialogs 'prompt-prefill: ❯ prefilled\|second line$' '' ''
               export FAKE_PI_LOG= ;;
     stall)    echo "[stall] manual-only: a slow fake (FAKE_PI_DELAY_MS>1s) triggers a headless hit-enter barrier."
               echo "[stall] Verify by hand: the status line shows 'pi run exceeded Ns - may be stuck'. Scenario: test/scenarios/t-stall.vim" ;;
@@ -409,11 +484,14 @@ the options, carefully"
 
     trackfile) export FAKE_PI_THINKING= FAKE_PI_TOOL= FAKE_PI_LOG=/tmp/fakepi-trackfile.log
               : > /tmp/fakepi-trackfile.log
-              run trackfile 6
-              # two distinct switches -> exactly two switch prompts (re-editing
-              # the same buffer is a no-op), and the log line for the second one
-              check trackfile 'I switched the file I am working on to: /tmp/t-trackfile-a\.txt' \
-                '' '' '"message":"I switched the file I am working on to:' 2
+              run trackfile 8
+              # switching files sends pi nothing by itself (no model turn) ...
+              check trackfile 'PROMPTS-BEFORE-SEND=0' '' ''
+              # ... the next prompt carries ONE notice, for the latest file only
+              # (a was superseded), and the prompt after it carries none
+              check trackfile '"message":"I switched the file I am working on to: /tmp/t-trackfile-b\.txt' \
+                '"message":"I switched[^"]*t-trackfile-a' '' '"message":"I switched the file' 1
+              check trackfile '"message":"second prompt"' '' ''
               check trackfile 'context file switched: /tmp/t-trackfile-b\.txt'
               export FAKE_PI_LOG= ;;
     *)        export FAKE_PI_THINKING= FAKE_PI_TOOL=;     run "$name" 10; check "$name" '' '' '' ;;

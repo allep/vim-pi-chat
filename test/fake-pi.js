@@ -25,6 +25,9 @@
 //   FAKE_PI_QUEUE=1        queue prompts sent mid-turn; one agent_settled
 //                          after the queue drains (like real pi)
 //   FAKE_PI_LIFE_LOG=p     append 'start <pid>' / 'exit <pid>' lines
+//   FAKE_PI_TOOL_OUTPUT=t  result text of every tool call (default: none)
+//   FAKE_PI_PARALLEL=1     two overlapping write calls (FAKE_PI_EDIT_PATH and
+//                          FAKE_PI_EDIT_PATH2), each with its own toolCallId
 //   FAKE_PI_LATE_NOTIFY_MS=n  emit one extra 'late note' notify n ms after
 //                             agent_settled (a background plugin notification
 //                             arriving after the turn, for cursor-park tests)
@@ -182,12 +185,36 @@ function handle(req, dequeued) {
                     details: { diff: process.env.FAKE_PI_DIFF || '   1 alpha\n-  2 beta\n+  2 gamma\n   3 delta',
                                firstChangedLine: 2 } };
                 }
+                if (process.env.FAKE_PI_TOOL_OUTPUT && !end.result) {
+                  end.result = { content: [{ type: 'text', text: process.env.FAKE_PI_TOOL_OUTPUT }] };
+                }
                 emit(end);
                 runNext();
               }, turn);
             }, turn);
           };
-          if (tools.length) runNext(); else finish();
+          if (process.env.FAKE_PI_PARALLEL) {
+            // Two overlapping write calls (like pi running one assistant
+            // message's tool calls in parallel): start A, start B, end A,
+            // end B - each with its own toolCallId.
+            const fs = require('fs');
+            const calls = [
+              { id: 'call_a', path: editPath, content: 'parallel-A\n' },
+              { id: 'call_b', path: process.env.FAKE_PI_EDIT_PATH2 || 'ctx2.txt', content: 'parallel-B\n' },
+            ];
+            for (const c of calls) {
+              emit({ type: 'tool_execution_start', toolCallId: c.id, toolName: 'write',
+                     args: { path: c.path, content: c.content } });
+            }
+            setTimeout(() => {
+              for (const c of calls) {
+                fs.writeFileSync(c.path, c.content);
+                emit({ type: 'tool_execution_end', toolCallId: c.id, toolName: 'write',
+                       result: { content: [{ type: 'text', text: 'ok' }] }, isError: false });
+              }
+              finish();
+            }, turn);
+          } else if (tools.length) runNext(); else finish();
 
           function finish() {
             const ntype = process.env.FAKE_PI_NOTIFY_TYPE || '';

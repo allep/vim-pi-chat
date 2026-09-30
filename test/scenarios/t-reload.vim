@@ -28,6 +28,13 @@ function! s:Final(ms)
   let l:c = bufnr('/tmp/t-reload-ctx.txt')
   " One-line dump of the context buffer: exact content + modified flag.
   call extend(l:out, ['BUF[' . join(getbufline(l:c, 1, 100000), '|') . '] MOD[' . getbufvar(l:c, '&modified') . ']'])
+  " The reload must also record the new file timestamp: a later :checktime
+  " (focus, CursorHold, :w) must not think the file changed behind Vim's
+  " back.  (Writing the lines with setbufline() left it stale -> W11.)
+  let s:fcs = 0
+  autocmd FileChangedShell * let s:fcs += 1 | let v:fcs_choice = ''
+  silent! checktime
+  call add(l:out, 'STALE[' . s:fcs . ']')
   call writefile(l:out, '/tmp/t-reload.txt')
   execute 'qall!'
 endfunction

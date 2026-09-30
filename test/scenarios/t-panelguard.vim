@@ -9,7 +9,7 @@
 " against) and verify:
 "   1. the chat window still shows the chat buffer,
 "   2. a different window shows the new file,
-"   3. pi was told about the switch (prompt + chat-buffer log line).
+"   3. pi is told about the switch with the next prompt (+ a chat log line).
 set nocompatible
 set noswapfile
 let s:root = fnamemodify(resolve(expand('<sfile>:p')), ':h:h:h')
@@ -48,4 +48,11 @@ endfunction
 let s:out = []
 call timer_start(300, { -> execute('silent! PiOpen') })
 call timer_start(1500, { -> execute('e /tmp/panel-b.txt') })
-call timer_start(3000, { -> s:Final() })
+" The switch notice rides on the user's next prompt (no prompt of its own).
+function! s:SendNext()
+  call win_gotoid(bufwinid(bufnr('__PiChat__')))
+  call setline('$', 'after the panel switch')
+  call PiChatSendInput()
+endfunction
+call timer_start(2000, { -> s:SendNext() })
+call timer_start(3500, { -> s:Final() })

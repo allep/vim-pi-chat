@@ -38,8 +38,10 @@ Commands                                                          *pi_chat-comma
     a message.
 
 :PiSend [<args>]                                              *:PiSend*
-    Send a prompt to the running agent from anywhere. While the agent is
-    busy the prompt is queued (see |g:pi_chat_streaming_behavior|). With
+    Send a prompt to the running agent from any window. While the agent
+    is busy the prompt is queued (see |g:pi_chat_streaming_behavior|).
+    Whatever is half-typed on the ❯ prompt is kept and comes back when the
+    turn ends. With
     no argument, jump to the chat prompt. The agent must already be
     running: otherwise an error asks you to use :PiOpen first.
 
@@ -66,8 +68,8 @@ Commands                                                          *pi_chat-comma
     the statusline shows the model pi reports.
 
 :PiThinking                                                   *:PiThinking*
-    Toggle the read-only thinking panel below the chat (opened
-    automatically with :PiOpen). Streams the model's thinking live,
+    Toggle the read-only thinking panel, a full-width window across the
+    bottom of the screen (opened automatically with :PiOpen). Streams the model's thinking live,
     auto-scrolled to the newest line; height is |g:pi_chat_thinking_height|.
     Thoughts accumulate even while hidden, under a `──── prompt` marker per
     turn, so opening it later shows past thinking; :PiClear / :PiClose wipe
@@ -141,11 +143,21 @@ g:pi_chat_context_file                            *g:pi_chat_context_file*
 
 g:pi_chat_track_files                          *g:pi_chat_track_files*
     When you switch to another file (with :e, :b, ...), update the context
-    file and tell pi about it, so its next turn works on the file you are
-    looking at. The notice is sent as a regular prompt, so a switch while
-    the agent is idle costs one (short) model turn; while pi is busy it
-    queues as a follow-up prompt.
+    file (logged in the chat), so pi works on the file you are looking at.
+    No prompt is sent for the switch itself, so switching costs no model
+    turn: your next prompt tells pi, opening with "I switched the file I
+    am working on to: <path>".
     Set to 0 to disable and manage the context file manually with :PiFile.
+    Default: 1
+
+g:pi_chat_quit_with_last_window          *g:pi_chat_quit_with_last_window*
+    :q, :x, :wq or ZZ in the last real (non-pi) window of a tab also
+    closes the pi panels there, so the command exits Vim (or closes the
+    tab) instead of leaving you in the chat. Quitting from inside the
+    chat, or with another file window open, works as usual; :close and
+    :only are not affected. If the quit then fails (e.g. E37 on :q with
+    unsaved changes), the panels stay closed: :PiOpen brings them back.
+    Set to 0 for plain Vim behavior.
     Default: 1
 
 g:pi_chat_master_prompt                        *g:pi_chat_master_prompt*
@@ -158,6 +170,21 @@ g:pi_chat_master_prompt                        *g:pi_chat_master_prompt*
     shows which one was applied on a fresh start. Changes take effect
     when the pi job restarts (e.g. :PiClear, or :PiClose + :PiOpen).
     Default: ''
+
+g:pi_chat_tool_diff                                  *g:pi_chat_tool_diff*
+    Show a diff preview for pi's edit/write tool calls.
+    Default: 1
+
+g:pi_chat_tool_diff_max                          *g:pi_chat_tool_diff_max*
+    Cap diff previews at this many lines (0 = no cap).
+    Default: 200
+
+g:pi_chat_tool_output                              *g:pi_chat_tool_output*
+    Show up to this many lines of a tool's output under its ✓ line, with a
+    "… N more lines" note; 0 turns it off. A failed tool always shows its
+    output (the error message) under the ✗ line. Successful read, edit and
+    write calls show none: file contents, or the diff preview above.
+    Default: 5
 
 g:pi_chat_autosave_context                      *g:pi_chat_autosave_context*
     When the context file has unsaved changes at send time: 1 saves it
@@ -201,10 +228,10 @@ so opening the same file again resumes that file's conversation; if there is
 no file session, the plugin falls back to the folder's conversation (a freshly
 opened file inherits its folder's history); otherwise a new conversation
 starts. The id is `pchat-<len>-<sha256>` of the resolved path, so every file
-gets its own. A resumed transcript is rebuilt from pi's session file: your
-prompts appear with the context prefix the plugin injected. On a
-resume the prior transcript is shown at the top of the chat buffer, above the
-input line. See |g:pi_chat_session_resume|, |g:pi_chat_session_fallback_dir|,
+gets its own. On a resume the prior transcript is shown at the top of the
+chat buffer, above the input line, laid out like the live chat: prompts as
+you typed them (without the context line the plugin adds for pi), and only
+the session's current branch (pi keeps abandoned branches in the file). See |g:pi_chat_session_resume|, |g:pi_chat_session_fallback_dir|,
 |g:pi_chat_session_dir| and |g:pi_chat_resume_max_messages|. With
 |g:pi_chat_no_session| set, no session is used and nothing is resumed.
 
@@ -216,18 +243,26 @@ In the chat input line (insert mode):
     <C-CR>      insert a newline (build a multi-line prompt)
     <C-c>       abort the current run
 
-    While pi is generating a turn, typing on the input line is ignored
-    (any typed text is reverted to the bare prompt). To queue or steer a
-    message while the agent is busy, use :PiSend explicitly.
+    While pi is generating a turn, typing on the input line is ignored:
+    the ❯ prompt is hidden (an in-chat "⏳ pi is working…" line shows
+    instead) and anything typed is discarded. A draft you had typed before
+    sending with :PiSend is kept and comes back when the turn ends. To
+    queue or steer a message while the agent is busy, use :PiSend
+    explicitly.
 
 In normal mode, in the chat buffer (buffer-local mappings):
     A           jump to the chat input line and append
     i           jump to the chat input line and start inserting
 
-Extension dialogs: `confirm`, `select` and `input` use Vim's native prompts;
-Esc on a `select` list sends a cancellation, never a choice. `editor`
-(multi-line text) dialogs are not supported yet and are answered as
-cancelled right away, with a notice in the chat.
+Extension dialogs: `confirm`, `select` and `input` use Vim's native prompts,
+showing the request's title and message. Esc always sends a cancellation,
+never a choice, and an `input` placeholder is shown as a hint (not
+pre-filled). `editor` (multi-line text) dialogs are not supported yet and are
+answered as cancelled right away, with a notice in the chat. `setStatus`
+entries are shown in the chat statusline, `set_editor_text` prefills the ❯
+prompt (once the turn ends, if pi is busy), and setWidget/setTitle are
+ignored. Dialog timeouts are left to pi (Vim runs no timers while a prompt
+waits).
 
 ==============================================================================
 Context file & autosave                                       *pi_chat-context*
@@ -240,9 +275,13 @@ asks you to (default), because pi edits the file on disk.
 ==============================================================================
 Live reload                                                     *pi_chat-reload*
 
-When pi edits or writes your context file via its tools, pi_chat reloads the
-buffer from disk so you see the change immediately. If the buffer has your
-own unsaved changes, the reload is skipped with a notification and a
+When pi edits or writes a file open in a buffer via its tools (or any tool,
+e.g. bash, rewrites your context file), pi_chat reloads the buffer from disk
+so you see the change immediately. Tool calls that pi runs in parallel are
+tracked individually. The reload uses Vim's own file-change check
+(|:checktime| with 'autoread' on for that buffer), so the cursor and undo
+history are kept and no "file changed" warning follows. If the buffer has
+your own unsaved changes, the reload is skipped with a notification and a
 `:e!` hint so it never clobbers your work.
 
 ==============================================================================

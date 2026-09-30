@@ -18,7 +18,7 @@ set cpo&vim
 "   :PiClear             start a fresh session (restarts the pi process)
 "   :PiRestart           restart the pi process, resuming the same session
 "   :PiClose             close the chat and stop the agent
-"   :PiThinking          toggle a panel below the chat streaming the model's
+"   :PiThinking          toggle a full-width panel at the bottom streaming the model's
 "                        thinking live (g:pi_chat_thinking_height)
 "   :PiFile [path]       show/set the context file (default: the buffer you had
 "                        open when :PiOpen started the session; pi's job runs
@@ -58,10 +58,13 @@ set cpo&vim
 "   g:pi_chat_map                  global normal-mode mapping, default <leader>pi
 "   g:pi_chat_context_file         1 = inject the context file into prompts
 "   g:pi_chat_track_files          1 = tell pi when you switch files (:e, :b)
+"   g:pi_chat_quit_with_last_window 1 = :q/:x in the last file window also
+"                                  closes the pi panels (exits Vim)
 "   g:pi_chat_autosave_context     1 = save the context file before a send
 "                                  (default 0: ask first)
 "   g:pi_chat_tool_diff            1 = diff preview for edit/write tools
 "   g:pi_chat_tool_diff_max        cap diff previews at N lines (0 = no cap)
+"   g:pi_chat_tool_output          show N lines of tool output (default 5, 0 = off)
 "   g:pi_chat_run_timeout          warn when a run exceeds N seconds (0 = off)
 "   g:pi_chat_master_prompt        path to a markdown file (or inline text) with
 "                                  standing rules, appended to pi's system prompt
@@ -113,12 +116,19 @@ if !exists('g:pi_chat_show_thinking')        | let g:pi_chat_show_thinking = 0 |
 if !exists('g:pi_chat_map')                  | let g:pi_chat_map = '<leader>pi' | endif
 if !exists('g:pi_chat_context_file')         | let g:pi_chat_context_file = 1 | endif
 if !exists('g:pi_chat_track_files')          | let g:pi_chat_track_files = 1 | endif
+" :q / :x / :wq / ZZ in the last real window of a tab also closes the pi
+" panels there, so the command exits Vim (or closes the tab) instead of
+" leaving you in the chat.
+if !exists('g:pi_chat_quit_with_last_window') | let g:pi_chat_quit_with_last_window = 1 | endif
 if !exists('g:pi_chat_autosave_context')     | let g:pi_chat_autosave_context = 0 | endif
 " Show a pi-style diff preview for file tools (write/edit).  1 = on,
 " 0 = off (just the "✓ write"/"✓ edit" line).
 if !exists('g:pi_chat_tool_diff')           | let g:pi_chat_tool_diff = 1 | endif
 " Cap diff previews at this many lines; 0 = no cap.
 if !exists('g:pi_chat_tool_diff_max')       | let g:pi_chat_tool_diff_max = 200 | endif
+" Show up to this many lines of a tool's output under its ✓/✗ line (0 = off).
+" Successful read/edit/write are skipped (file contents, or the diff above).
+if !exists('g:pi_chat_tool_output')         | let g:pi_chat_tool_output = 5 | endif
 " Master prompt: a file (or inline text) of standing rules, passed to pi with
 " --append-system-prompt so every session starts with it in the system prompt.
 if !exists('g:pi_chat_master_prompt')        | let g:pi_chat_master_prompt = '' | endif
@@ -138,7 +148,9 @@ if !exists('g:pi_chat_run_timeout')          | let g:pi_chat_run_timeout = 300 |
 
 " ------------------------------ internal state -----------------------------
 
-let s:job = ''
+" The pi process: a Job, or v:null when none is tracked.  Test it with
+" s:HasJob(), never empty(): empty() is also true for a Job that has exited.
+let s:job = v:null
 let s:buf = -1
 let s:bufname = '__PiChat__'
 " File the user was working on when :PiOpen started the session. Injected into
@@ -154,6 +166,9 @@ let s:panel_wins = {}
 " the resume kind chosen at start ('file', 'dir' or 'new') for the log hint.
 let s:session_id = ''
 let s:resumed_kind = ''
+" 1 after g:pi_chat_track_files re-keyed the context file: the next prompt
+" tells pi about the switch (see s:FileSwitch / s:UserPrompt).
+let s:switch_pending = 0
 " 1 while s:StartJob() is opening the chat window (see s:ChatWinGained).
 let s:starting = 0
 " Pending deferred park check (timer id, or -1); see s:ChatWinLost.
@@ -164,6 +179,12 @@ let s:park_timer = -1
 let s:transcript = []
 let s:guarding = 0
 let s:pinning = 0
+" Half-typed prompt block saved while a :PiSend prompt runs (restored by
+" s:HideWorking when the turn ends), or text pi asked to prefill
+" (set_editor_text) while busy.
+let s:input_stash = []
+" Extension status entries (setStatus): statusKey -> statusText.
+let s:ext_status = {}
 " Reentrancy flag for s:GuardBusyInput (typing while pi is generating).
 let s:typing_guard = 0
 " Thinking panel (:PiThinking): a small horizontal split under the chat
@@ -186,18 +207,18 @@ let s:input_line = 0
 let s:tail_line = 0
 let s:tail = ''
 
-" File path of the tool currently running (from the tool_execution_start
-" args), so tool_execution_end can live-reload the open buffer if pi edited a
-" file the user has loaded.
-let s:cur_tool_path = ''
-
-" [mtime, size] of the context file at the start of the current tool.  If
-" either differs at tool_execution_end and the tool was not edit/write
-" (those already reload), *something* (e.g. a bash sed) rewrote the file,
-" so reload the open buffer the same way.  Size disambiguates edits that
-" land in the same wall-clock second as the snapshot (getftime is
-" second-granular).
-let s:ctx_stat = [-1, -1]
+" In-flight tool calls, keyed by pi's toolCallId (tool calls from one
+" assistant message can run in parallel, so a single "current tool" would be
+" overwritten by the next start).  Each entry holds:
+"   path  the file the tool targets (tool_execution_start args), so
+"         tool_execution_end can live-reload the open buffer if pi edited a
+"         file the user has loaded;
+"   stat  [mtime, size] of the context file at the tool's start.  If either
+"         differs at its end and the tool was not edit/write (those already
+"         reload), *something* (e.g. a bash sed) rewrote the file, so the
+"         open buffer is reloaded the same way.  Size disambiguates edits
+"         landing in the same wall-clock second (getftime is second-granular).
+let s:tools = {}
 
 let s:running = 0
 let s:queue = []
@@ -318,21 +339,9 @@ function! s:PiSend(...)
   call s:UserPrompt(l:text)
 endfunction
 
-" getwininfo() dictionary key for the window's buffer number: recent Vims
-" renamed 'winbufnr' to 'bufnr'; support both.
-function! s:WinBufnr(w)
-  return get(a:w, 'winbufnr', get(a:w, 'bufnr', -1))
-endfunction
-
+" Window id of a window showing the chat buffer (any tab), or -1.
 function! s:FindWin()
-  let l:win = -1
-  for l:w in getwininfo()
-    if s:WinBufnr(l:w) == s:buf
-      let l:win = l:w.winid
-      break
-    endif
-  endfor
-  return l:win
+  return s:buf > 0 ? get(win_findbuf(s:buf), 0, -1) : -1
 endfunction
 
 " Run a closure with the chat window guaranteed current.  The chat pipeline
@@ -425,22 +434,51 @@ function! s:SyncInputLine()
   endif
 endfunction
 
+" Chat-buffer primitives.  Everything that edits the transcript goes through
+" these, which address the chat BUFFER (s:buf) rather than the current
+" window: :PiSend, :PiFile, :PiAbort, the drain tick, ... can all run while
+" the user sits in a file window or while the chat is hidden (parked), and
+" the window-relative getline()/setline()/append()/line('$') then read and
+" rewrote the user's FILE (a :PiSend from a file window deleted its lines
+" and wrote the transcript into it).
+function! s:NLines()
+  return getbufinfo(s:buf)[0].linecount
+endfunction
+
+function! s:Line(lnum)
+  return get(getbufline(s:buf, a:lnum), 0, '')
+endfunction
+
+function! s:SetLine(lnum, text)
+  call setbufline(s:buf, a:lnum, a:text)
+endfunction
+
+function! s:AppendLines(after, lines)
+  call appendbufline(s:buf, a:after, a:lines)
+endfunction
+
+function! s:DeleteLines(first, last)
+  if a:last >= a:first
+    call deletebufline(s:buf, a:first, a:last)
+  endif
+endfunction
+
 " Refresh the authoritative transcript copy from the buffer's log region
 " (lines 1 .. s:input_line-1). Call this after every plugin log edit so the
 " copy and the buffer stay in sync before the next user edit is checked.
 function! s:CaptureTranscript()
   let l:stop = s:input_line - 1
-  if l:stop < 1
+  if l:stop < 1 || s:buf < 1 || !bufloaded(s:buf)
     let s:transcript = []
   else
-    let s:transcript = getline(1, l:stop)
+    let s:transcript = getbufline(s:buf, 1, l:stop)
   endif
 endfunction
 
-" Revert any user edit to the read-only log. The plugin always edits via
-" ex-commands (which do not fire TextChanged), so a change to the log region
-" means the user typed into the transcript; restore the authoritative copy and
-" a fresh prompt. The log is lines 1..len(s:transcript) and the input block
+" Revert any user edit to the read-only log. Every plugin edit re-captures
+" s:transcript right away (s:CaptureTranscript), so when TextChanged fires
+" and the log region no longer matches it, the user typed into the
+" transcript; restore the authoritative copy and a fresh prompt. The log is lines 1..len(s:transcript) and the input block
 " must occupy at least the line below it, so any buffer shorter than that has
 " had the prompt (and possibly log lines) eaten by backspace.
 function! s:GuardTranscript()
@@ -451,18 +489,20 @@ function! s:GuardTranscript()
     return
   endif
   let l:t = len(s:transcript)
-  if line('$') < l:t + 1 || getline(1, l:t) !=# s:transcript
+  if s:NLines() < l:t + 1 || getbufline(s:buf, 1, l:t) !=# s:transcript
     let s:guarding = 1
-    call setline(1, s:transcript + ['❯ '])
-    if line('$') > l:t + 1
-      execute (l:t + 2) . ',$delete_'
-    endif
+    call s:SetLine(1, s:transcript + ['❯ '])
+    call s:DeleteLines(l:t + 2, s:NLines())
     let s:input_line = l:t + 1
     let s:tail_line = 0
     let s:tail = ''
     " Reset the reentrancy flag before touching cursor/insert mode so the guard
     " cannot be left permanently stuck if anything below raises an error.
     let s:guarding = 0
+    " The cursor belongs to the current window: only move it in the chat.
+    if bufnr('%') != s:buf
+      return
+    endif
     if mode() =~# 'i'
       call cursor(s:input_line, s:InputCol(s:input_line))
       startinsert!
@@ -553,14 +593,11 @@ function! s:ClearInputBlock(keep)
     return
   endif
   call s:SyncInputLine()
-  let l:last = line('$')
-  if l:last > s:input_line
-    execute s:input_line + 1 . ',' . l:last . 'delete_'
-  endif
-  if a:keep && getline(s:input_line) =~# '^❯'
+  call s:DeleteLines(s:input_line + 1, s:NLines())
+  if a:keep && s:Line(s:input_line) =~# '^❯'
     return
   endif
-  call setline(s:input_line, '❯ ')
+  call s:SetLine(s:input_line, '❯ ')
   call s:CaptureTranscript()
 endfunction
 
@@ -593,7 +630,12 @@ function! PiChatStatusText()
   endif
   let l:st = getbufvar(s:buf, 'pi_status')
   " getbufvar() returns the string itself (or '' when unset); never a list.
-  return type(l:st) == v:t_string ? l:st : ''
+  let l:st = type(l:st) == v:t_string ? l:st : ''
+  " Extension status entries (setStatus), in key order.
+  if !empty(s:ext_status)
+    let l:st .= '  · ' . join(map(sort(keys(s:ext_status)), 's:ext_status[v:val]'), ' · ')
+  endif
+  return l:st
 endfunction
 
 " Right-hand statusline part: the model pi is currently using, shown after
@@ -693,8 +735,11 @@ function! s:ShowWorking()
     return
   endif
   call s:AddLogLines(['⏳ pi is working…'])
-  if s:input_line <= line('$')
-    call setline(s:input_line, '')
+  if s:input_line <= s:NLines()
+    " Blank the whole input block (prompt + continuation lines): typing is
+    " ignored while pi works; a half-typed block was stashed by the caller.
+    call s:DeleteLines(s:input_line + 1, s:NLines())
+    call s:SetLine(s:input_line, '')
   endif
 endfunction
 
@@ -703,7 +748,8 @@ endfunction
 " line, so it is safe to call from every turn-end path (settle, abort, clear).
 " Searches upward from the input line for the nearest ⏳ marker — s:AddLogLines
 " shifts absolute line numbers as the turn streams, so a stored number would
-" go stale. After deletion the prompt glyph is restored on the input line.
+" go stale. After deletion the prompt block is restored on the input line:
+" the half-typed text stashed in s:input_stash, else a bare ❯ prompt.
 function! s:HideWorking()
   if s:buf < 1 || !buflisted(s:buf) || s:input_line < 1
     return
@@ -712,28 +758,55 @@ function! s:HideWorking()
   " Search upward (toward the top of the buffer) from the input line for the
   " nearest working marker. The marker is the last ⏳ line above the prompt;
   " it may sit several lines up once the reply has streamed in below it.
-  for l:i in range(s:input_line - 1, 1, -1)
-    if stridx(getline(l:i), '⏳ pi is working') == 0
-      let l:ln = l:i
+  let l:log = s:input_line > 1 ? getbufline(s:buf, 1, s:input_line - 1) : []
+  for l:i in range(len(l:log) - 1, 0, -1)
+    if stridx(l:log[l:i], '⏳ pi is working') == 0
+      let l:ln = l:i + 1
       break
     endif
   endfor
   if l:ln > 0
-    call deletebufline(s:buf, l:ln)
+    call s:DeleteLines(l:ln, l:ln)
     let s:input_line -= 1
     if s:tail_line > l:ln
       let s:tail_line -= 1
     endif
   endif
-  if s:input_line <= line('$')
-    call setline(s:input_line, '❯ ')
+  if s:input_line <= s:NLines()
+    call s:RestoreInputBlock()
   endif
   call s:CaptureTranscript()
   call s:GuardTranscript()
 endfunction
 
+" Put the prompt block back on the input line: the stashed half-typed block
+" (see s:StashInputBlock) if there is one, else a bare ❯ prompt.
+function! s:RestoreInputBlock()
+  let l:block = empty(s:input_stash) ? ['❯ '] : s:input_stash
+  let s:input_stash = []
+  call s:DeleteLines(s:input_line + 1, s:NLines())
+  call s:SetLine(s:input_line, l:block[0])
+  if len(l:block) > 1
+    call s:AppendLines(s:input_line, l:block[1:])
+  endif
+endfunction
+
+" Save the current prompt block if the user has typed something into it, so a
+" prompt sent past it (:PiSend, :PiOpen <msg>) does not throw it away; it is
+" put back when the turn ends (s:HideWorking).  While a turn is in flight the
+" block is blank (typing is ignored), so an earlier stash is kept.
+function! s:StashInputBlock()
+  if s:buf < 1 || !bufloaded(s:buf) || s:input_line < 1
+    return
+  endif
+  let l:block = getbufline(s:buf, s:input_line, '$')
+  if !empty(l:block) && l:block[0] =~# '^❯' && l:block !=# ['❯ '] && l:block !=# ['❯']
+    let s:input_stash = l:block
+  endif
+endfunction
+
 " ------------------------------ thinking panel -----------------------------
-" :PiThinking toggles a small horizontal panel below the chat where the
+" :PiThinking toggles a full-width horizontal panel at the screen bottom where the
 " model's thinking streams live.  The panel is a separate, NOMODIFIABLE
 " buffer, so the user can browse it (ctrl+w) but can't edit or delete
 " streamed thinking.  This build makes setbufline/deletebufline honor that
@@ -957,7 +1030,7 @@ function! s:PiThinking()
     " if a leftover buffer of that name still exists (and is nomodifiable).
     call s:ThinkBufWrite({ -> s:ThinkBufClear() })
   endif
-  " open the new window below the chat window when we can find it
+  " open the panel as a full-width window at the bottom (botright)
   " win_gotoid jumps to the window by ID. (execute l:winid . 'wincmd w' would
   " instead run wincmd w winid TIMES - a cyclic hop, not a jump.)
   let l:cwin = s:FindWin()
@@ -1015,11 +1088,58 @@ augroup PiChatFileTrack
   autocmd BufEnter * call s:OnFileEnter()
 augroup END
 
+" Quitting the last real window of a tab (g:pi_chat_quit_with_last_window).
+augroup PiChatQuit
+  autocmd!
+  autocmd QuitPre * call s:OnQuitPre()
+augroup END
+
+function! s:IsPanelWin(winid)
+  let l:b = winbufnr(a:winid)
+  return l:b > 0 && (l:b == s:buf || l:b == s:think_buf)
+endfunction
+
+" QuitPre fires for :quit, :exit/:xit, :wq and ZZ - before Vim decides
+" whether the command closes just this window or exits - but not for :close
+" or :only.  When the window being quit is the tab's last real window and
+" everything else there is a pi panel, close the panels first: the command
+" then exits Vim (or closes the tab), as it would without the plugin.  Quits
+" from inside a panel keep their meaning (closing the chat parks the agent).
+" If the quit then fails (E37: unsaved changes), the panels stay closed;
+" :PiOpen brings them back with the transcript intact.
+function! s:OnQuitPre()
+  if !get(g:, 'pi_chat_quit_with_last_window', 1) || s:IsPanelWin(win_getid())
+    return
+  endif
+  let l:here = win_getid()
+  let l:panels = []
+  for l:w in gettabinfo(tabpagenr())[0].windows
+    if l:w == l:here
+      continue
+    endif
+    if !s:IsPanelWin(l:w)
+      " Another real window remains: :q just closes this one, as usual.
+      return
+    endif
+    call add(l:panels, l:w)
+  endfor
+  for l:w in l:panels
+    let l:nr = win_id2win(l:w)
+    if l:nr > 0
+      execute l:nr . 'close'
+    endif
+  endfor
+endfunction
+
 " ------------------------------ job control --------------------------------
 
 function! s:UserPrompt(text)
   " a new prompt starts a fresh thinking block; earlier turns stay visible
   call s:ThinkNewTurn(a:text)
+  " :PiSend / :PiOpen <msg> send past whatever the user was typing on the ❯
+  " prompt: keep it (restored when the turn ends) instead of wiping it.  The
+  " <CR> path already consumed its block, so there is nothing to stash there.
+  call s:StashInputBlock()
   call s:ClearInputBlock(0)
   call s:AddLogLines(['', '❯ ' . a:text])
   " A prompt sent while a turn is in flight is queued by pi (followUp/steer)
@@ -1036,6 +1156,9 @@ function! s:UserPrompt(text)
   " working on; pi's read/edit tools do the rest. Unsaved buffers count too:
   " the path tells pi where to create the file.
   let l:msg = a:text
+  " After a file switch (g:pi_chat_track_files) the first prompt says so.
+  let l:lead = s:switch_pending ? s:ctx_lead_switched : s:ctx_lead_is
+  let l:told = 0
   if g:pi_chat_context_file
     let l:ctx = s:context_file
     if l:ctx ==# ''
@@ -1044,16 +1167,17 @@ function! s:UserPrompt(text)
       let l:ctx = expand('#:p')
     endif
     if l:ctx !=# '' && isdirectory(fnamemodify(l:ctx, ':h'))
+      let l:told = 1
       if filereadable(l:ctx)
-        let l:msg = 'The file I am working on is: ' . l:ctx
-              \ . ' (read it if you need its contents; edit it in place when asked).' . "\n"
-              \ . a:text
+        let l:msg = l:lead . l:ctx . s:ctx_hint_edit . "\n" . a:text
       else
-        let l:msg = 'The file I am working on is: ' . l:ctx
-              \ . ' (not saved to disk yet; create it when I ask for new content).' . "\n"
-              \ . a:text
+        let l:msg = l:lead . l:ctx . s:ctx_hint_new . "\n" . a:text
       endif
     endif
+  endif
+  if s:switch_pending && !l:told && s:context_file !=# ''
+    " Context injection is off, but the user did switch files: still say so.
+    let l:msg = l:lead . s:context_file . s:ctx_hint_read . "\n" . a:text
   endif
   let l:cmd = {'type': 'prompt', 'message': l:msg}
   if g:pi_chat_streaming_behavior !=# ''
@@ -1062,23 +1186,22 @@ function! s:UserPrompt(text)
   " Only arm the busy state when the prompt actually reached the channel:
   " a failed send (dead agent) would otherwise leave the spinner running
   " and the input guard discarding every keystroke until vim is restarted.
-  if s:Send(l:cmd) && !l:queued
+  let l:sent = s:Send(l:cmd)
+  if l:sent
+    let s:switch_pending = 0
+  endif
+  if l:sent && !l:queued
     call s:BusyStart()
   endif
 endfunction
 
+function! s:HasJob()
+  return type(s:job) == v:t_job
+endfunction
+
+" job_status() is 'run', 'fail' (could not start) or 'dead'.
 function! s:JobAlive()
-  if empty(s:job)
-    return 0
-  endif
-  try
-    " right after job_start() the status is still 'new'; some builds report
-    " 'run' instead of 'running'
-    let l:st = job_status(s:job)
-    return l:st ==# 'run' || l:st ==# 'running' || l:st ==# 'new'
-  catch
-    return 0
-  endtry
+  return s:HasJob() && job_status(s:job) ==# 'run'
 endfunction
 
 " Returns 1 if the command reached the channel, 0 on failure. A failed send
@@ -1177,53 +1300,41 @@ function! s:ChooseSessionId(context_file) abort
   return [l:base_id, 'new']
 endfunction
 
-" Render a saved pi session's user/assistant conversation as chat lines so a
-" resumed session shows its prior history above the input line.
-function! s:LoadSessionTranscript(sid) abort
-  if empty(a:sid)
-    return []
-  endif
-  let l:files = glob(s:SessionBaseDir() . '/*/*' . a:sid . '.jsonl', 1, 1)
-  if type(l:files) == v:t_string
-    let l:files = split(l:files, "\n")
-  endif
-  if empty(l:files)
-    return []
-  endif
-  let l:out = []
-  for l:raw in readfile(l:files[0])
-    if l:raw !~# '"type":"message"'
-      continue
-    endif
-    try
-      let l:obj = json_decode(l:raw)
-    catch
-      continue
-    endtry
-    let l:msg = get(l:obj, 'message', {})
-    let l:role = type(l:msg) == v:t_dict ? get(l:msg, 'role', '') : ''
-    if l:role !=# 'user' && l:role !=# 'assistant'
-      continue
-    endif
-    let l:text = s:MessageText(l:msg)
-    if empty(l:text)
-      continue
-    endif
-    call add(l:out, l:role ==# 'user' ? '❯ ' . l:text : l:text)
-  endfor
-  " Cap the resumed transcript to the most recent N messages so a long session
-  " never floods the chat buffer on open (0 = no cap).
-  let l:cap = get(g:, 'pi_chat_resume_max_messages', 50)
-  if type(l:cap) == v:t_number && l:cap > 0 && len(l:out) > l:cap
-    let l:out = l:out[len(l:out) - l:cap :]
-  endif
-  return l:out
+" The context prefix s:UserPrompt puts in front of every prompt (pi never
+" sees the Vim buffer list, so it is told which file the user works on).
+" One place for the wording, so s:StripContextPrefix can take it back off
+" when a session is replayed.
+let s:ctx_lead_is = 'The file I am working on is: '
+let s:ctx_lead_switched = 'I switched the file I am working on to: '
+let s:ctx_hint_edit = ' (read it if you need its contents; edit it in place when asked).'
+let s:ctx_hint_new = ' (not saved to disk yet; create it when I ask for new content).'
+let s:ctx_hint_read = ' (read it if you need its contents).'
+
+function! s:ReEscape(text) abort
+  return escape(a:text, '\.*$^~[]')
 endfunction
 
-" Prior thinking for a session, in order: for each assistant thinking block, a
-" '──── <prompt>' marker (the flattened user message that preceded it, so the
-" resumed panel reads like the live one) followed by the thinking text.
-function! s:LoadSessionThinking(sid) abort
+" A replayed user message minus the plugin's context prefix: returns
+" [text, switched_to] - switched_to is the path of a bare file-switch notice
+" (the whole message; older sessions sent those as prompts of their own).
+function! s:StripContextPrefix(text) abort
+  let l:leads = s:ReEscape(s:ctx_lead_is) . '\|' . s:ReEscape(s:ctx_lead_switched)
+  let l:hints = join(map([s:ctx_hint_edit, s:ctx_hint_new, s:ctx_hint_read],
+        \ 's:ReEscape(v:val)'), '\|')
+  let l:bare = '^' . s:ReEscape(s:ctx_lead_switched) . '\(.\{-}\)\%(' . l:hints . '\)$'
+  if a:text =~# l:bare
+    return ['', matchlist(a:text, l:bare)[1]]
+  endif
+  return [substitute(a:text, '^\%(' . l:leads . '\).\{-}\%(' . l:hints . '\)\n', '', ''), '']
+endfunction
+
+" The user/assistant messages on a saved session's ACTIVE branch, in order.
+" A pi session file is a tree (entries link to their parent through
+" id/parentId; branching keeps the abandoned paths in the file) and the
+" current position - the leaf - is the last entry written, so walk from it
+" up to the root.  Files without ids (v1 sessions, hand-written fixtures)
+" are read linearly.
+function! s:SessionMessages(sid) abort
   if empty(a:sid)
     return []
   endif
@@ -1235,24 +1346,95 @@ function! s:LoadSessionThinking(sid) abort
     return []
   endif
   let l:entries = []
-  let l:last_user = ''
+  let l:byid = {}
+  let l:leaf = ''
   for l:raw in readfile(l:files[0])
-    if l:raw !~# '"type":"message"'
-      continue
-    endif
     try
-      let l:obj = json_decode(l:raw)
+      let l:e = json_decode(l:raw)
     catch
       continue
     endtry
-    let l:msg = get(l:obj, 'message', {})
-    let l:role = type(l:msg) == v:t_dict ? get(l:msg, 'role', '') : ''
-    if l:role ==# 'user'
-      let l:utext = s:MessageText(l:msg)
+    if type(l:e) != v:t_dict || get(l:e, 'type', '') ==# 'session'
+      continue
+    endif
+    call add(l:entries, l:e)
+    let l:id = get(l:e, 'id', '')
+    if type(l:id) == v:t_string && l:id !=# ''
+      let l:byid[l:id] = l:e
+      let l:leaf = l:id
+    endif
+  endfor
+  let l:onpath = {}
+  let l:cur = l:leaf
+  while l:cur !=# '' && has_key(l:byid, l:cur) && !has_key(l:onpath, l:cur)
+    let l:onpath[l:cur] = 1
+    let l:parent = get(l:byid[l:cur], 'parentId', v:null)
+    let l:cur = type(l:parent) == v:t_string ? l:parent : ''
+  endwhile
+  let l:out = []
+  for l:e in l:entries
+    if get(l:e, 'type', '') !=# 'message'
+      continue
+    endif
+    if l:leaf !=# '' && !has_key(l:onpath, get(l:e, 'id', ''))
+      continue
+    endif
+    let l:msg = get(l:e, 'message', {})
+    if type(l:msg) == v:t_dict && index(['user', 'assistant'], get(l:msg, 'role', '')) >= 0
+      call add(l:out, l:msg)
+    endif
+  endfor
+  return l:out
+endfunction
+
+" Render a saved pi session's user/assistant conversation as chat lines so a
+" resumed session shows its prior history above the input line - laid out
+" like the live chat: a blank line and '❯ <what you typed>' per prompt (the
+" plugin's context prefix stripped again), then the reply.
+function! s:LoadSessionTranscript(sid) abort
+  let l:turns = []
+  for l:msg in s:SessionMessages(a:sid)
+    let l:text = s:MessageText(l:msg)
+    if empty(l:text)
+      continue
+    endif
+    if get(l:msg, 'role', '') ==# 'user'
+      let [l:text, l:switched] = s:StripContextPrefix(l:text)
+      if l:switched !=# ''
+        call add(l:turns, ['', 'pi-chat: context file switched: ' . l:switched])
+      elseif l:text !=# ''
+        call add(l:turns, ['', '❯ ' . l:text])
+      endif
+    else
+      call add(l:turns, [l:text])
+    endif
+  endfor
+  " Cap the resumed transcript to the most recent N messages so a long session
+  " never floods the chat buffer on open (0 = no cap).
+  let l:cap = get(g:, 'pi_chat_resume_max_messages', 50)
+  if type(l:cap) == v:t_number && l:cap > 0 && len(l:turns) > l:cap
+    let l:turns = l:turns[len(l:turns) - l:cap :]
+  endif
+  let l:out = []
+  for l:t in l:turns
+    call extend(l:out, l:t)
+  endfor
+  return l:out
+endfunction
+
+" Prior thinking for a session, in order: for each assistant thinking block, a
+" '──── <prompt>' marker (the flattened user message that preceded it, so the
+" resumed panel reads like the live one) followed by the thinking text.
+function! s:LoadSessionThinking(sid) abort
+  let l:entries = []
+  let l:last_user = ''
+  for l:msg in s:SessionMessages(a:sid)
+    if get(l:msg, 'role', '') ==# 'user'
+      let l:utext = s:StripContextPrefix(s:MessageText(l:msg))[0]
       if !empty(l:utext)
         let l:last_user = substitute(l:utext, '\n', ' ', 'g')
       endif
-    elseif l:role ==# 'assistant'
+    else
       let l:think = s:MessageThinking(l:msg)
       if !empty(l:think)
         let l:sec = []
@@ -1334,6 +1516,11 @@ function! s:StartJob()
     return
   endif
 
+  " A brand-new conversation has no earlier file to have switched from.
+  if s:fresh || s:clear_new_session
+    let s:switch_pending = 0
+  endif
+
   " s:OpenWindow() puts the chat buffer in a window, which fires its
   " BufWinEnter -> s:ChatWinGained().  That must not start a second job
   " underneath this one (the outer call would then overwrite s:job and
@@ -1353,13 +1540,21 @@ function! s:StartJob()
   " A restarted process has no memory of the old one: drop a stale working
   " line / busy flag left behind if the agent died while a send was in
   " flight, so the :PiOpen recovery path always lands on a usable panel.
-  call s:HideWorking()
+  " A half-typed prompt is stashed first so the reset puts it back.  (A
+  " brand-new buffer has nothing to recover: resetting it there left a dead
+  " duplicate ❯ line under the header.)
+  if !s:fresh
+    call s:StashInputBlock()
+    call s:HideWorking()
+  endif
   call s:BusyStop()
 
   let s:running = 0
   let s:queue = []
   let s:tail = ''
   let s:tail_line = 0
+  " A new process starts with fresh extensions: drop their old status.
+  let s:ext_status = {}
   call s:SetStatus('pi chat')
 
   let l:cmd = ['pi', '--mode', 'rpc']
@@ -1436,7 +1631,7 @@ function! s:StartJob()
     " The command is a List: no shell is involved, so no quoting is needed.
     let s:job = job_start(l:cmd, l:opts)
   catch
-    let s:job = ''
+    let s:job = v:null
     echohl ErrorMsg
     echomsg 'pi-chat: failed to start pi: ' . v:exception
     echohl None
@@ -1476,14 +1671,17 @@ function! s:StartJob()
         call s:FlushThinkTail()
       endif
     endif
-    call setline(line('$') + 1, '❯ ')
+    call s:SetLine(s:NLines() + 1, '❯ ')
+    let s:input_line = s:NLines()
   else
-    " Resuming: keep a half-typed prompt if there is one.
-    if getline(line('$')) !~# '^❯'
-      call setline(line('$'), '❯ ')
+    " Resuming: keep the (possibly multi-line, half-typed) prompt block.
+    if s:input_line < 1 || s:input_line > s:NLines()
+      let s:input_line = s:NLines()
+    endif
+    if s:Line(s:input_line) !~# '^❯'
+      call s:SetLine(s:input_line, '❯ ')
     endif
   endif
-  let s:input_line = line('$')
   call s:CaptureTranscript()
   if !l:quiet
     call s:GotoInputInsert()
@@ -1492,7 +1690,7 @@ endfunction
 
 function! s:StopJob()
   call s:StopDrain()
-  if !empty(s:job)
+  if s:HasJob()
     try
       call ch_close(s:job)
     catch
@@ -1501,11 +1699,12 @@ function! s:StopJob()
       call job_stop(s:job)
     catch
     endtry
-    let s:job = ''
+    let s:job = v:null
   endif
   call s:BusyStop()
   let s:running = 0
   let s:queue = []
+  let s:tools = {}
   let s:tail = ''
   let s:tail_line = 0
 endfunction
@@ -1526,9 +1725,12 @@ endfunction
 " drives this call itself).
 "
 " React only when a:buf is a real file (not chat, thinking panel, or any
-" virtual buffer) and differs from the current context file.  When the agent
-" is running, send pi a short prompt so it knows the working file changed;
-" when it is not, just remember the file for the next :PiOpen.
+" virtual buffer) and differs from the current context file: re-key the
+" context file and, when the agent is running, log the switch in the chat.
+" pi is NOT sent a prompt of its own - that would cost a full model turn on
+" every :e / :b / quickfix jump - it is told with the user's next prompt,
+" which then opens with 'I switched the file I am working on to: ...'
+" (s:switch_pending).
 function! s:FileSwitch(buf) abort
   if !g:pi_chat_track_files
     return
@@ -1557,17 +1759,11 @@ function! s:FileSwitch(buf) abort
   endif
   let s:context_file = l:fn
   let s:context_buf = a:buf
+  let s:switch_pending = 1
   if !s:JobAlive()
     return
   endif
-  let l:msg = 'I switched the file I am working on to: ' . l:fn
-        \ . ' (read it if you need its contents).'
   call s:WithChatWin(function('s:FileSwitchLog', [l:fn]))
-  let l:cmd = {'type': 'prompt', 'message': l:msg}
-  if g:pi_chat_streaming_behavior !=# ''
-    let l:cmd.streamingBehavior = g:pi_chat_streaming_behavior
-  endif
-  call s:Send(l:cmd)
 endfunction
 
 function! s:OnFileEnter() abort
@@ -1627,7 +1823,8 @@ endfunction
 " Runs with the chat window current; keep it side-effect-free apart from the
 " log line (s:WithChatWin runs the closure synchronously).
 function! s:FileSwitchLog(name) abort
-  call s:AddLogLines(['', 'pi-chat: context file switched: ' . a:name])
+  call s:AddLogLines(['', 'pi-chat: context file switched: ' . a:name
+        \ . ' (pi is told with your next prompt)'])
 endfunction
 
 function! s:PiFile(path)
@@ -1690,18 +1887,36 @@ function! s:ReloadFile(path, ...)
           \ . ' - you have unsaved changes; :e! to reload its content')
     return
   endif
-  " Push the on-disk content into the buffer without switching windows.
-  " setbufline() with a List only overwrites from line 1: when the file
-  " shrank, old trailing lines survive (this build has no range setline nor
-  " buflinecount()), so delete the old tail first, then write the new lines.
   let l:new = readfile(l:fn)
-  let l:old = len(getbufline(l:b, 1, '$'))
-  if l:old > 1
-    call deletebufline(l:b, 2, l:old)
+  " Reload through Vim's own file-change check: with 'autoread' on for this
+  " buffer, :checktime re-reads it from disk (shown or hidden, keeping the
+  " cursor and undo history) AND records the new file timestamp.  Writing
+  " the lines with setbufline() left that timestamp stale, so Vim still saw
+  " "the file changed since reading it": W11 prompts on the next checktime
+  " or focus, and a warning on :w.  The option goes back to following the
+  " global value afterwards.
+  let l:tick = getbufvar(l:b, 'changedtick')
+  call setbufvar(l:b, '&autoread', 1)
+  try
+    execute 'silent! checktime ' . l:b
+  finally
+    call setbufvar(l:b, '&autoread', -1)
+  endtry
+  " (changedtick, not a line comparison: readfile() keeps the \r of a
+  " 'fileformat=dos' file, the buffer does not.)
+  if getbufvar(l:b, 'changedtick') == l:tick
+        \ && getbufline(l:b, 1, '$') !=# (empty(l:new) ? [''] : l:new)
+    " Not reloaded (e.g. a FileChangedShell autocmd of the user's declined
+    " it): push the content in directly.  setbufline() with a List only
+    " overwrites from line 1, so delete the old tail first.
+    let l:old = len(getbufline(l:b, 1, '$'))
+    if l:old > 1
+      call deletebufline(l:b, 2, l:old)
+    endif
+    call setbufline(l:b, 1, empty(l:new) ? [''] : l:new)
+    " setbufline() marks the buffer modified; it now matches disk.
+    call setbufvar(l:b, '&modified', 0)
   endif
-  call setbufline(l:b, 1, empty(l:new) ? [''] : l:new)
-  " setbufline() marks the buffer modified; it now matches disk, so clear it.
-  call setbufvar(l:b, '&modified', 0)
   call s:Notify('reloaded ' . fnamemodify(l:fn, ':t') . ' (' . l:reason . ')')
   " Force a repaint: the reloaded window is usually the one in the
   " background while the user sits in the chat panel, and vim may not
@@ -1745,7 +1960,6 @@ function! s:DiffFormat(old, new)
   if l:h0 > 0
     call add(l:out, ' ' . printf('%*s', l:w, '') . ' ...')
   endif
-  let l:num = l:h0 + 1
   for l:i in range(l:h0, l:p - 1)
     call add(l:out, ' ' . printf('%*s', l:w, l:i + 1) . ' ' . a:new[l:i])
   endfor
@@ -1898,7 +2112,7 @@ endfunction
 " Delete the whole log above the prompt block (not blank it: overwriting
 " with '' left one empty line per old transcript line at the top).
 function! s:WipeTranscript()
-  if s:input_line - 1 > line('$')
+  if s:input_line - 1 > s:NLines()
     return
   endif
   call deletebufline(s:buf, 1, s:input_line - 1)
@@ -1914,7 +2128,7 @@ function! s:PiRestart()
   " JSONL and the on-screen transcript are kept, only the process state is
   " rebuilt.  Use after changing g:pi_chat_args (or pi's own config /
   " extensions) without losing the conversation, and as recovery for a wedged
-  " or already-exited process (a dead s:job is fine: StopJob skips the kill).
+  " or already-exited process (a dead s:job is fine: stopping it is a no-op).
   " s:clear_new_session stays 0, so StartJob's create-or-resume picks the id
   " back up instead of wiping it; s:fresh stays 0, so the transcript and any
   " half-typed prompt are preserved.  Note: this does NOT re-read this
@@ -1932,14 +2146,8 @@ function! s:PiRestart()
   call s:AddLogLines(['↻ pi process restarted (session resumed)'])
 endfunction
 
-function! s:PiClose(...)
+function! s:PiClose()
   call s:ThinkCloseAll()
-  if a:0 > 0 && a:1
-    " invoked from BufDelete: the buffer is already gone
-    let s:buf = -1
-    call s:StopJob()
-    return
-  endif
   let l:buf = s:buf
   call s:StopJob()
   let s:buf = -1
@@ -2068,7 +2276,10 @@ function! PiChatSendInput()
   endif
   " The input block is the prompt line plus whatever continuation lines the
   " user opened below it (up to the last line).
-  let l:lines = getline(s:input_line, '$')
+  let l:lines = getbufline(s:buf, s:input_line, '$')
+  if empty(l:lines)
+    return
+  endif
   if l:lines[0] =~# '^❯\s*$'
     let l:lines[0] = ''
   else
@@ -2079,10 +2290,8 @@ function! PiChatSendInput()
     return
   endif
   " Drop the rest of the block; the prompt line itself becomes a fresh ❯.
-  if line('$') > s:input_line
-    execute s:input_line + 1 . ',' . line('$') . 'delete_'
-  endif
-  call setline(s:input_line, '❯ ')
+  call s:DeleteLines(s:input_line + 1, s:NLines())
+  call s:SetLine(s:input_line, '❯ ')
   call s:UserPrompt(l:text)
   call s:GotoInputInsert()
 endfunction
@@ -2133,10 +2342,12 @@ function! s:BufSetup()
   syn match PiChatDiffDel  '^  -.*'
   syn match PiChatDiffCtx  '^ \{2}\s\+\d\+\(\s.*\)\?\|^  \d\+\s*$\|^ \{2}\s\+\.\.\.\s*$'
   syn match PiChatDiffMore '^  ….*'
+  syn match PiChatToolOut  '^    │.*'
   hi def link PiChatDiffAdd  DiffAdd
   hi def link PiChatDiffDel  DiffDelete
   hi def link PiChatDiffCtx  NonText
   hi def link PiChatDiffMore NonText
+  hi def link PiChatToolOut  Comment
   call s:ApplyMarkdown()
 
   " The transcript stays modifiable (programmatic :append/setline fail under
@@ -2212,9 +2423,7 @@ function! s:OnExit(job, code)
   " purpose, so the old process's exit can arrive after s:job was cleared or
   " replaced (s:StopJob() below would then kill the live one).  exit_cb gets
   " the Job itself; compare process ids (a Job/Channel `!=` is always true).
-  " Test the type, not empty(): a Job that has exited counts as empty, so
-  " empty(s:job) is already true for the very exit being handled here.
-  if type(s:job) != v:t_job || s:JobPid(s:job) != s:JobPid(a:job)
+  if !s:HasJob() || s:JobPid(s:job) != s:JobPid(a:job)
     return
   endif
   let l:was_alive = s:JobAlive()
@@ -2398,7 +2607,7 @@ function! s:AddLogLines(lines)
   " If the line the block would land right below is already blank, drop
   " leading blanks too (they would just extend the same separator).
   let l:at = s:tail_line > 0 ? s:tail_line - 1 : s:input_line - 1
-  if l:at >= 1 && getline(l:at) ==# ''
+  if l:at >= 1 && s:Line(l:at) ==# ''
     while !empty(l:clean) && l:clean[0] ==# ''
       call remove(l:clean, 0)
     endwhile
@@ -2408,11 +2617,11 @@ function! s:AddLogLines(lines)
   endif
   let l:n = len(l:clean)
   if s:tail_line > 0
-    call append(s:tail_line - 1, l:clean)
+    call s:AppendLines(s:tail_line - 1, l:clean)
     let s:input_line += l:n
     let s:tail_line += l:n
   else
-    call append(s:input_line - 1, l:clean)
+    call s:AppendLines(s:input_line - 1, l:clean)
     let s:input_line += l:n
   endif
   call s:CaptureTranscript()
@@ -2420,34 +2629,30 @@ endfunction
 
 " --------------------------------- streaming --------------------------------
 
-function! s:StrIndex(s, sub)
-  return stridx(a:s, a:sub)
-endfunction
-
 function! s:FlushTail()
   if s:tail ==# ''
     if s:tail_line > 0
-      call setline(s:tail_line, '')
+      call s:SetLine(s:tail_line, '')
       call s:CaptureTranscript()
     endif
     return
   endif
   let l:pos = s:tail
   let l:lines = []
-  let l:nl = s:StrIndex(l:pos, "\n")
+  let l:nl = stridx(l:pos, "\n")
   while l:nl >= 0
     " strpart, not l:pos[:l:nl - 1]: at l:nl == 0 that slice is [:-1], the
     " WHOLE string, which re-emitted the text after a leading newline.
     call add(l:lines, strpart(l:pos, 0, l:nl))
     let l:pos = l:pos[l:nl + 1 :]
-    let l:nl = s:StrIndex(l:pos, "\n")
+    let l:nl = stridx(l:pos, "\n")
   endwhile
   if !empty(l:lines)
     call s:AddLogLines(l:lines)
   endif
   let s:tail = l:pos
   if s:tail_line > 0
-    call setline(s:tail_line, s:tail)
+    call s:SetLine(s:tail_line, s:tail)
   else
     call s:AddLogLines([s:tail])
     let s:tail_line = s:input_line - 1
@@ -2464,14 +2669,14 @@ function! s:CommitTail()
   let s:tail = ''
   let s:tail_line = 0
   if l:had_line > 0
-    if getline(l:had_line) ==# ''
+    if s:Line(l:had_line) ==# ''
       " The message text ended in a newline: the tail line is just an empty
       " placeholder. If the line above it is already blank (the model's
       " trailing \n\n), drop the placeholder so the gap stays a single
       " separator line; otherwise the placeholder itself is the separator
       " and it stays.
-      if l:had_line > 1 && getline(l:had_line - 1) ==# ''
-        call deletebufline(s:buf, l:had_line)
+      if l:had_line > 1 && s:Line(l:had_line - 1) ==# ''
+        call s:DeleteLines(l:had_line, l:had_line)
         let s:input_line -= 1
         call s:CaptureTranscript()
       endif
@@ -2539,16 +2744,20 @@ function! s:HandleEvent(msg)
   elseif l:t ==# 'tool_execution_start'
     let l:name = get(a:msg, 'toolName', 'tool')
     let l:args = get(a:msg, 'args', {})
-    " Remember which file this tool targets so we can live-reload it on end.
-    let s:cur_tool_path = get(l:args, 'path', get(l:args, 'file_path', ''))
-    " Snapshot the context file's [mtime, size] so tool_execution_end can
-    " detect a tool other than edit/write (e.g. bash) rewriting it.
-    let s:ctx_stat = (s:context_file !=# '' && filereadable(s:context_file))
-          \ ? [getftime(s:context_file), getfsize(s:context_file)] : [-1, -1]
+    if type(l:args) != v:t_dict
+      let l:args = {}
+    endif
+    " Remember which file this tool targets (to live-reload it on end) and
+    " snapshot the context file, so tool_execution_end can detect a tool
+    " other than edit/write (e.g. bash) rewriting it.
+    let l:path = get(l:args, 'path', get(l:args, 'file_path', ''))
+    let s:tools[s:ToolKey(a:msg)] = {
+          \ 'path': type(l:path) == v:t_string ? l:path : '',
+          \ 'stat': s:ContextStat()}
     let l:detail = ''
-    if has_key(l:args, 'command')
+    if type(get(l:args, 'command', 0)) == v:t_string
       let l:detail = '  ⚙ ' . l:name . '  ' . l:args.command
-    elseif has_key(l:args, 'path')
+    elseif type(get(l:args, 'path', 0)) == v:t_string
       let l:detail = '  ⚙ ' . l:name . '  ' . l:args.path
     else
       let l:detail = '  ⚙ ' . l:name
@@ -2557,14 +2766,22 @@ function! s:HandleEvent(msg)
     " write: the full new content is in the args, so preview the diff now
     " (pi does not compute one for writes).
     if l:name ==# 'write' && get(g:, 'pi_chat_tool_diff', 1)
-          \ && has_key(l:args, 'path')
-          \ && !empty(get(l:args, 'content', ''))
+          \ && type(get(l:args, 'path', 0)) == v:t_string
+          \ && type(get(l:args, 'content', 0)) == v:t_string
+          \ && l:args.content !=# ''
       call s:WriteDiff(l:args.path, l:args.content)
     endif
   elseif l:t ==# 'tool_execution_end'
     let l:tname = get(a:msg, 'toolName', 'tool')
+    let l:key = s:ToolKey(a:msg)
+    let l:tool = get(s:tools, l:key, {'path': '', 'stat': [-1, -1]})
+    if has_key(s:tools, l:key)
+      call remove(s:tools, l:key)
+    endif
     if get(a:msg, 'isError', v:false)
       call s:AddLogLines(['  ✗ ' . get(a:msg, 'toolName', 'tool') . ' failed'])
+      " The output of a failed tool is its error message: always show it.
+      call s:AddLogLines(s:ToolOutput(get(a:msg, 'result', {})))
     else
       " pi hands us a ready-to-display diff for edits in result.details.diff
       " (same format as s:DiffFormat, so the same highlight rules apply).
@@ -2581,22 +2798,79 @@ function! s:HandleEvent(msg)
         endif
       endif
       call s:AddLogLines(['  ✓ ' . l:tname])
+      if index(['read', 'edit', 'write'], l:tname) < 0
+        call s:AddLogLines(s:ToolOutput(get(a:msg, 'result', {})))
+      endif
       " pi's edit/write tool just wrote a file: if it's open, reload it live.
       if l:tname ==# 'edit' || l:tname ==# 'write'
-        call s:ReloadFile(s:cur_tool_path)
-      elseif s:ctx_stat[0] >= 0 && s:context_file !=# ''
-        \ && filereadable(s:context_file)
-        \ && [getftime(s:context_file), getfsize(s:context_file)] !=# s:ctx_stat
+        call s:ReloadFile(l:tool.path)
+      elseif l:tool.stat[0] >= 0 && s:ContextStat() !=# l:tool.stat
         " Some other tool (bash, ...) rewrote the context file on disk:
         " reload the open buffer the same way so it can't lag behind.
         call s:ReloadFile(s:context_file, 'changed on disk')
       endif
+      " The context file's on-disk state is now what the buffer shows:
+      " re-baseline the tools still in flight, so a parallel bash that ends
+      " later does not report (and reload) this same change a second time.
+      let l:now = s:ContextStat()
+      for l:other in values(s:tools)
+        let l:other.stat = l:now
+      endfor
     endif
-    let s:cur_tool_path = ''
-    let s:ctx_stat = [-1, -1]
   elseif l:t ==# 'extension_ui_request'
     call s:UiRequest(a:msg)
   endif
+endfunction
+
+" A tool result's text (its 'text' content blocks, or a plain string) as
+" indented '    │ ' lines, capped at g:pi_chat_tool_output lines with a
+" '… N more lines' note.  [] when there is nothing to show or the option is 0.
+function! s:ToolOutput(result)
+  let l:max = get(g:, 'pi_chat_tool_output', 5)
+  if type(l:max) != v:t_number || l:max <= 0
+    return []
+  endif
+  let l:content = type(a:result) == v:t_dict ? get(a:result, 'content', '') : a:result
+  let l:parts = []
+  if type(l:content) == v:t_string
+    call add(l:parts, l:content)
+  elseif type(l:content) == v:t_list
+    for l:block in l:content
+      if type(l:block) == v:t_dict && get(l:block, 'type', '') ==# 'text'
+            \ && type(get(l:block, 'text', 0)) == v:t_string
+        call add(l:parts, l:block.text)
+      endif
+    endfor
+  endif
+  let l:lines = split(substitute(join(l:parts, "\n"), '\r', '', 'g'), "\n", 1)
+  " Drop leading/trailing blank lines (commands routinely end in "\n").
+  while !empty(l:lines) && l:lines[-1] =~# '^\s*$'
+    call remove(l:lines, -1)
+  endwhile
+  while !empty(l:lines) && l:lines[0] =~# '^\s*$'
+    call remove(l:lines, 0)
+  endwhile
+  if empty(l:lines)
+    return []
+  endif
+  let l:out = map(l:lines[: l:max - 1], '"    │ " . v:val')
+  if len(l:lines) > l:max
+    call add(l:out, '    │ … ' . (len(l:lines) - l:max) . ' more lines')
+  endif
+  return l:out
+endfunction
+
+" Key of a tool call in s:tools: pi's toolCallId (servers without one share
+" a single slot, i.e. the old one-tool-at-a-time behavior).
+function! s:ToolKey(msg)
+  let l:id = get(a:msg, 'toolCallId', '')
+  return type(l:id) == v:t_string && l:id !=# '' ? l:id : '-'
+endfunction
+
+" [mtime, size] of the context file, or [-1, -1] when there is none.
+function! s:ContextStat()
+  return (s:context_file !=# '' && filereadable(s:context_file))
+        \ ? [getftime(s:context_file), getfsize(s:context_file)] : [-1, -1]
 endfunction
 
 function! s:HandleDelta(msg)
@@ -2624,23 +2898,37 @@ endfunction
 
 " ----------------------------- extension UI --------------------------------
 
-" rpc.md: extension_ui_request carries `method` plus method-specific
-" top-level fields (message, title, options, placeholder, prefill); the
-" reply is an extension_ui_response with the same `id` and `value`
-" (select/input/editor) or `confirmed` (confirm). `notify` never expects a
-" reply.
+" rpc-extension-ui.md: an extension_ui_request carries `method` plus
+" method-specific top-level fields (title, message, options, placeholder,
+" prefill).  Dialog methods (select/confirm/input/editor) block the
+" extension until an extension_ui_response with the same `id` arrives:
+" `value` (select/input/editor), `confirmed` (confirm) or `cancelled`.
+" Fire-and-forget methods never get a reply.
+"
+" Dialogs run synchronously inside the drain tick, so a request's `timeout`
+" cannot be enforced here (Vim runs no timers while a callback waits in a
+" prompt); pi auto-resolves it on its side, and a late answer is ignored.
+let s:ui_fire_and_forget = ['setWidget', 'setTitle']
+
 function! s:UiRequest(req)
   let l:method = get(a:req, 'method', '')
   let l:label = get(a:req, 'title', get(a:req, 'message', 'pi chat'))
   let l:rid = get(a:req, 'id', '')
   if l:method ==# 'notify'
     call s:Notify(get(a:req, 'message', l:label), tolower(get(a:req, 'notifyType', 'info')))
+  elseif l:method ==# 'setStatus'
+    call s:SetExtStatus(get(a:req, 'statusKey', ''), get(a:req, 'statusText', v:null))
+  elseif l:method ==# 'set_editor_text'
+    call s:SetPromptText(get(a:req, 'text', ''))
+  elseif index(s:ui_fire_and_forget, l:method) >= 0
+    " Widget/title updates have no chat equivalent; they expect no reply.
+    return
   elseif l:method ==# 'confirm'
-    call s:UiRespond(l:rid, {'confirmed': s:ConfirmPrompt(a:req)})
+    call s:UiRespond(l:rid, s:ConfirmPrompt(a:req))
   elseif l:method ==# 'select'
     call s:UiRespond(l:rid, s:SelectPrompt(a:req))
   elseif l:method ==# 'input'
-    call s:UiRespond(l:rid, {'value': s:InputPrompt(a:req)})
+    call s:UiRespond(l:rid, s:InputPrompt(a:req))
   elseif l:method ==# 'editor'
     " Not supported yet: the old scratch-buffer version blocked Vim in a
     " sleep loop inside the drain timer (the user could not type into it)
@@ -2649,8 +2937,38 @@ function! s:UiRequest(req)
           \ . '), which pi-chat does not support yet: cancelled', 'warning')
     call s:UiRespond(l:rid, {'cancelled': v:true})
   else
-    " Unknown method: cancel so the extension does not block forever.
+    " Unknown (future) dialog method: cancel so the extension never blocks.
     call s:UiRespond(l:rid, {'cancelled': v:true})
+  endif
+endfunction
+
+" setStatus: an extension's status entry, shown after the chat statusline
+" text (PiChatStatusText); no text (or null) clears the key.
+function! s:SetExtStatus(key, text)
+  if type(a:key) != v:t_string || a:key ==# ''
+    return
+  endif
+  if type(a:text) == v:t_string && a:text !=# ''
+    let s:ext_status[a:key] = substitute(a:text, '\n', ' ', 'g')
+  elseif has_key(s:ext_status, a:key)
+    call remove(s:ext_status, a:key)
+  endif
+  if s:buf > 0 && buflisted(s:buf) && s:FindWin() > 0
+    silent! redrawstatus!
+  endif
+endfunction
+
+" set_editor_text: pi (an extension) prefills the ❯ prompt.  While a turn is
+" in flight the prompt is blank and typing is ignored, so the text waits in
+" s:input_stash and appears when the turn ends.
+function! s:SetPromptText(text)
+  if type(a:text) != v:t_string || s:buf < 1 || !bufloaded(s:buf) || s:input_line < 1
+    return
+  endif
+  let l:lines = split(a:text, "\n", 1)
+  let s:input_stash = ['❯ ' . l:lines[0]] + l:lines[1:]
+  if !s:busy
+    call s:RestoreInputBlock()
   endif
 endfunction
 
@@ -2687,15 +3005,35 @@ function! s:Notify(message, ...)
   if strdisplaywidth(l:msg) > winwidth(0)
     let l:msg = strcharpart(l:msg, 0, winwidth(0) - 4) . ' ...'
   endif
-  echohl l:echogroup
+  " :echohl takes a literal group name, not an expression.
+  execute 'echohl ' . l:echogroup
   echomsg l:msg
   echohl None
 endfunction
 
-" The protocol's confirm request has no 'default' field; default to Yes.
+" Prompt text for a dialog: its title, plus the message when both are set
+" (confirm: title "Clear session?", message "All messages will be lost.").
+function! s:DialogText(req, default)
+  let l:title = get(a:req, 'title', '')
+  let l:message = get(a:req, 'message', '')
+  let l:parts = filter([l:title, l:message], 'type(v:val) == v:t_string && v:val !=# ""')
+  return empty(l:parts) ? a:default : join(l:parts, "\n")
+endfunction
+
+" Returns the response payload: {'confirmed': 0/1}, or {'cancelled': v:true}
+" when the dialog is dismissed (Esc).  The request has no 'default' field;
+" Enter picks Yes.
 function! s:ConfirmPrompt(req)
-  let l:msg = get(a:req, 'message', get(a:req, 'title', 'Confirm'))
-  return confirm(l:msg, '&Yes' . nr2char(10) . '&No', 1, 'question') == 1
+  return s:ConfirmPayload(confirm(s:DialogText(a:req, 'Confirm?'),
+        \ "&Yes\n&No", 1, 'Question'))
+endfunction
+
+" confirm()'s answer (1 = Yes, 2 = No, 0 = dismissed) -> response payload.
+function! s:ConfirmPayload(ans)
+  if a:ans == 0
+    return {'cancelled': v:true}
+  endif
+  return {'confirmed': a:ans == 1 ? v:true : v:false}
 endfunction
 
 " Display label for one select option (a string, or {id, label}).
@@ -2709,17 +3047,16 @@ function! s:OptionValue(opt)
 endfunction
 
 " Returns the extension_ui_response payload: {'value': ...}, or
-" {'cancelled': v:true} when the user dismisses the list.
+" {'cancelled': v:true} when the user dismisses the list.  Always asks, even
+" for a single option: the extension wants the user's decision.
 function! s:SelectPrompt(req)
   let l:options = get(a:req, 'options', [])
   if type(l:options) != v:t_list || empty(l:options)
     return {'cancelled': v:true}
   endif
-  if len(l:options) == 1
-    return {'value': s:OptionValue(l:options[0])}
-  endif
-  let l:labels = map(copy(l:options), "'  ' . nr2char(65 + v:key) . ') ' . s:OptionLabel(v:val)")
-  call insert(l:labels, get(a:req, 'title', get(a:req, 'message', 'Choose:')))
+  " inputlist() returns the NUMBER typed, so the entries are numbered.
+  let l:labels = map(copy(l:options), "'  ' . (v:key + 1) . '. ' . s:OptionLabel(v:val)")
+  call insert(l:labels, s:DialogText(a:req, 'Choose:'))
   let l:pick = inputlist(l:labels)
   if l:pick < 1 || l:pick > len(l:options)
     " Esc/cancel is a cancellation, never a choice: the first option is
@@ -2729,9 +3066,19 @@ function! s:SelectPrompt(req)
   return {'value': s:OptionValue(l:options[l:pick - 1])}
 endfunction
 
+" Returns {'value': text} or {'cancelled': v:true} (Esc).  The placeholder
+" is a hint, not a value, so it is shown in the prompt instead of being
+" pre-filled (Enter would otherwise send the hint text as the answer).
+" inputdialog()'s cancelreturn is what tells Esc apart from an empty entry.
 function! s:InputPrompt(req)
-  " 'message' is the prompt text; 'placeholder' pre-fills the field.
-  return input(get(a:req, 'message', 'Input: ') . ': ', get(a:req, 'placeholder', ''))
+  let l:prompt = s:DialogText(a:req, 'Input')
+  let l:hint = get(a:req, 'placeholder', '')
+  if type(l:hint) == v:t_string && l:hint !=# ''
+    let l:prompt .= ' (' . l:hint . ')'
+  endif
+  let l:cancel = "\x01pi-chat-cancelled"
+  let l:v = inputdialog(l:prompt . ': ', '', l:cancel)
+  return l:v ==# l:cancel ? {'cancelled': v:true} : {'value': l:v}
 endfunction
 
 let &cpo = s:save_cpo
