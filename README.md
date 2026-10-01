@@ -378,6 +378,16 @@ Notes:
 - `g:pi_chat_run_timeout` watchdog: when a run is still busy past the budget the
   status line appends `(long run: :PiClose to stop)` and one transcript line
   `⏱ pi run exceeded Ns - may be stuck; :PiClose to force-stop` is logged.
+
+### Releasing
+
+Releases are automated with [semantic-release](https://github.com/semantic-release/semantic-release):
+a `release` job (`.github/workflows/test.yml`, config in `release.config.json`)
+runs after the E2E suite passes on pushes to `main`, bumps the version from the
+conventional commit messages, tags it (`vX.Y.Z`) and publishes a GitHub Release
+with generated notes. To trigger a release, write commits as `fix: …` (patch),
+`feat: …` (minor) or with a `BREAKING CHANGE` footer / `!` suffix (major);
+plain messages do not produce a release.
   Verify by hand with a slow reply (or a hung pi).
 
 Expected results (see `test/vimrc-test` header for the full spec):
