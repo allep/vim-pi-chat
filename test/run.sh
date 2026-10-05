@@ -221,6 +221,20 @@ and then acting"
               # to bold, not italic; the forbid list also catches the render
               # failure strings (which the plain ': ok' min-two would not).
               check markdown 'PiMdHeading: ok' 'absent\|mismatch\|item-missing\|render-harness\|render-bold\|render-italic' ': ok' 'render-ok' '1' ;;
+    stress)   export FAKE_PI_THINKING=1 FAKE_PI_TOOL=
+              # ~3000 thinking lines (~150KB) => ~150k one-char
+              # thinking_delta frames.  Pre-fix (per-delta panel work) this is
+              # minutes of O(n^2) work and the run never drains; post-fix the
+              # whole stream must drain within the 22s budget, so the panel
+              # head/tail and the echo reply must all be present when the
+              # dump is taken.
+              export FAKE_PI_THINKING_TEXT="$(seq 1 3000 | awk '{printf "reasoning step %04d with enough padding to matter\n", $1}')"
+              run stress 22
+              check stress 'PANELHEAD ──── think about it' '' ''
+              check stress 'PANELTAIL reasoning step 3000' '' ''
+              check stress 'CHATTAIL Echo: think about it' '' ''
+              check stress '^PANELCOUNT 3001$' '' '' '' '^PANELCOUNT 3001$'
+              export FAKE_PI_THINKING_TEXT= ;;
     working)  export FAKE_PI_DELAY_MS=2500 FAKE_PI_TURN_MS=100 FAKE_PI_THINKING= FAKE_PI_TOOL=
               run working 7
               # in flight: working line shown, reply not yet; after settle: reply in, working gone.

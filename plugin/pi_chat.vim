@@ -198,6 +198,21 @@ let s:typing_guard = 0
 " buffer where the model's thinking streams live. -1 = never created.
 let s:think_buf = -1       " bufnr of the thinking panel buffer, or -1
 let s:think_text = ''      " full thinking text for the current turn
+" Incremental panel sync state: streamed deltas are collected in
+" s:think_pending (O(1) per delta) and the panel buffer is brought up to
+" date ONCE per drain tick (s:ThinkFlush) instead of per delta, which made
+" long thinking sessions O(n^2).  s:think_frag is the trailing in-flight
+" line of s:think_synced_text ('' while it ends in a newline or is empty),
+" s:think_synced_text the prefix of s:think_text already reflected in the
+" buffer, s:think_lines the buffer's line count, s:think_synced whether
+" the buffer matches that rendered state (0 when the panel is closed or a
+" full re-render is due).
+let s:think_frag = ''
+let s:think_lines = 0
+let s:think_synced = 0
+let s:think_pending = []
+let s:think_synced_text = ''
+let s:think_dirty = 0
 " Model label for the statusline (filled from pi's get_state / set_model /
 " cycle_model responses, i.e. only after pi confirmed). Empty until pi answers.
 let s:model_label = ''
@@ -213,6 +228,11 @@ let s:md_done = {}
 let s:input_line = 0
 let s:tail_line = 0
 let s:tail = ''
+" changedtick of the last programmatic edit the plugin made to the chat
+" buffer (kept current by the s:SetLine/s:AppendLines/s:DeleteLines
+" primitives).  s:GuardTranscript uses it to tell plugin-driven TextChanged
+" events (bail out in O(1)) apart from real user edits (full compare).
+let s:plugin_tick = 0
 
 " In-flight tool calls, keyed by pi's toolCallId (tool calls from one
 " assistant message can run in parallel, so a single "current tool" would be
@@ -456,23 +476,34 @@ function! s:Line(lnum)
   return get(getbufline(s:buf, a:lnum), 0, '')
 endfunction
 
+" The chat buffer's programmatic edits go through these three primitives so
+" s:plugin_tick (the buffer's changedtick after the last plugin edit) stays
+" accurate.  s:GuardTranscript bails out in O(1) when the newest edit was
+" the plugin's own; s:transcript is kept incrementally by the call sites
+" (O(1) per delta) instead of a full getbufline per delta - the old
+" per-delta capture plus per-keystroke compare is what made long sessions
+" crawl at O(n^2).
 function! s:SetLine(lnum, text)
   call setbufline(s:buf, a:lnum, a:text)
+  let s:plugin_tick = getbufvar(s:buf, 'changedtick')
 endfunction
 
 function! s:AppendLines(after, lines)
   call appendbufline(s:buf, a:after, a:lines)
+  let s:plugin_tick = getbufvar(s:buf, 'changedtick')
 endfunction
 
 function! s:DeleteLines(first, last)
   if a:last >= a:first
     call deletebufline(s:buf, a:first, a:last)
+    let s:plugin_tick = getbufvar(s:buf, 'changedtick')
   endif
 endfunction
 
 " Refresh the authoritative transcript copy from the buffer's log region
-" (lines 1 .. s:input_line-1). Call this after every plugin log edit so the
-" copy and the buffer stay in sync before the next user edit is checked.
+" (lines 1 .. s:input_line-1).  The hot streaming paths keep s:transcript
+" incrementally (O(1) per delta); this full re-capture remains for the rare
+" non-streaming paths (turn end, user commands, restore, new session).
 function! s:CaptureTranscript()
   let l:stop = s:input_line - 1
   if l:stop < 1 || s:buf < 1 || !bufloaded(s:buf)
@@ -493,6 +524,20 @@ function! s:GuardTranscript()
     return
   endif
   if s:buf < 1 || !buflisted(s:buf) || empty(s:transcript)
+    return
+  endif
+  " TextChanged also fires for the plugin's own streaming edits (they bump
+  " changedtick).  The event is deferred to the next redraw, at which point
+  " the cursor has moved on, so bail while the cursor sits in the prompt /
+  " input block.
+  if s:input_line > 0 && line('.') >= s:input_line
+    return
+  endif
+  " The newest buffer edit was ours: s:transcript already reflects it, so
+  " this TextChanged carries no user edit.  (User edits - typed or backspace
+  " - always bump changedtick past s:plugin_tick and fall through to the
+  " full compare below.)
+  if getbufvar(s:buf, 'changedtick') == s:plugin_tick
     return
   endif
   let l:t = len(s:transcript)
@@ -859,22 +904,33 @@ endfunction
 
 function! s:ThinkReset()
   let s:think_text = ''
+  let s:think_frag = ''
+  let s:think_lines = 0
+  let s:think_synced = 0
+  let s:think_pending = []
+  let s:think_synced_text = ''
+  let s:think_dirty = 0
   if s:think_buf < 0 || !bufexists(s:think_buf)
     return
   endif
   call s:ThinkBufWrite({ -> s:ThinkBufClear() })
+  let s:think_synced = 1
+  let s:think_lines = 1
 endfunction
 
 " a new prompt appends a marker line instead of clearing, so the panel keeps
 " the conversation's thinking history, each turn under its prompt marker.
+" The marker lands mid-stream (before the in-flight fragment), so this is a
+" full re-render - but it happens once per prompt, not per delta.
 function! s:ThinkNewTurn(text)
+  call s:ThinkMergePending()
   let l:head = '──── ' . substitute(a:text, '\n', ' ', 'g')
   if empty(s:think_text)
     let s:think_text = l:head . "\n"
   else
     let s:think_text .= "\n" . l:head . "\n"
   endif
-  call s:FlushThinkTail()
+  call s:ThinkRenderFull()
 endfunction
 
 " Runs a:func with the panel buffer temporarily modifiable.  The buffer is
@@ -911,37 +967,142 @@ function! s:ThinkBufClear()
   endif
 endfunction
 
-" Re-renders the panel buffer from s:think_text (complete lines plus the
-" trailing fragment).  The buffer is small (a few hundred lines at most), so
-" a full setbufline sync per flush is cheap.  The cursor is re-parked at the
-" bottom on every flush, so while the model is still thinking the panel
-" always auto-scrolls to the newest line; once the stream settles the user
-" is free to scroll back up (the buffer is nomodifiable, so browsing can't
-" clobber the content).  Parking is a win_gotoid hop: this build's cursor()
-" has no {win} argument (cursor(w, n) silently acts on the CURRENT window),
-" and redraw is deferred until this flush returns, so the hop never steals
-" focus.
-function! s:FlushThinkTail()
-  if empty(s:think_text)
+" Re-renders the panel buffer from scratch out of s:think_text: every
+" complete line plus the trailing in-flight fragment (empty text renders as
+" the single placeholder blank line a fresh buffer starts with).  Called on
+" panel open, after a reset, on session resume, and for the once-per-prompt
+" turn marker - not per delta (that's s:ThinkAppendDelta).
+function! s:ThinkRenderFull()
+  if s:think_buf < 0 || !bufexists(s:think_buf)
     return
   endif
-  if s:think_buf >= 0
-    let l:parts = split(s:think_text, "\n", 1)
-    let l:render = l:parts[:-2]  " complete lines
-    if l:parts[-1] !=# ''
-      call add(l:render, l:parts[-1])
+  call s:ThinkMergePending()
+  let l:parts = split(s:think_text, "\n", 1)
+  let s:think_frag = l:parts[-1]
+  let l:render = copy(l:parts)
+  if l:render[-1] ==# ''
+    " remove() honours negative indexes; list slicing (render[:-1]) does not
+    " in this build and silently returns the whole list.
+    call remove(l:render, -1)
+  endif
+  if empty(l:render)
+    let l:render = ['']
+  endif
+  call s:ThinkBufWrite({ -> s:ThinkBufSync(l:render) })
+  let s:think_lines = len(l:render)
+  let s:think_synced = 1
+  let s:think_synced_text = s:think_text
+  call s:ThinkParkCursor()
+endfunction
+
+" Folds the unflushed delta list into s:think_text.  Appending the whole
+" list with one join keeps the per-delta cost O(delta) instead of O(n) per
+" string concatenation.
+function! s:ThinkMergePending()
+  if empty(s:think_pending)
+    return
+  endif
+  let s:think_text .= join(s:think_pending, '')
+  let s:think_pending = []
+endfunction
+
+" Panel invariant: the buffer holds split(s:think_text, "\n", 1) with the
+" trailing '' dropped - the complete lines plus the in-flight fragment - or
+" the single placeholder blank line while s:think_text is empty.
+" Appends one thinking delta: O(1) list push, no buffer or window work at
+" all.  s:ThinkFlush (end of each drain tick) is the only place the panel
+" buffer is touched, so a long stream costs O(delta) per tick instead of
+" O(n) per delta.
+function! s:ThinkAppendDelta(delta)
+  if a:delta ==# ''
+    return
+  endif
+  call add(s:think_pending, a:delta)
+  if s:think_buf > 0 && bufexists(s:think_buf) && s:think_synced
+    let s:think_dirty = 1
+  endif
+endfunction
+
+" Flushed once per drain tick: merges the pending deltas into
+" s:think_text and brings the panel buffer up to date in ONE pass - one
+" modifiable toggle, one append for the new lines, one cursor park.
+function! s:ThinkFlush()
+  if !s:think_dirty || empty(s:think_pending)
+    return
+  endif
+  if s:think_buf < 0 || !bufexists(s:think_buf) || !s:think_synced
+    return
+  endif
+  let l:placeholder = (s:think_synced_text ==# '')
+  call s:ThinkMergePending()
+  let l:new = strpart(s:think_text, strlen(s:think_synced_text))
+  let l:parts = split(l:new, "\n", 1)
+  if empty(s:think_frag)
+    " the buffer's last line is complete (or the placeholder): every part
+    " is a fresh line
+    let l:target = copy(l:parts)
+  else
+    " the buffer's last line is the in-flight fragment: the first part
+    " extends it
+    let l:target = [s:think_frag . l:parts[0]] + l:parts[1:]
+  endif
+  if l:target[-1] ==# ''
+    " remove() honours negative indexes; list slicing ([:-1]) does not in
+    " this build and silently returns the whole list.
+    call remove(l:target, -1)
+  endif
+  let s:think_dirty = 0
+  let s:think_synced_text = s:think_text
+  if empty(l:target)
+    return
+  endif
+  let l:extend = !empty(s:think_frag)
+  call s:ThinkBufWrite({ -> s:ThinkApplyTarget(l:target, l:extend, l:placeholder) })
+  let s:think_frag = (s:think_text =~# '\n$') ? '' : l:target[-1]
+  let s:think_lines += l:extend ? len(l:target) - 1
+        \ : l:placeholder ? len(l:target) - 1 : len(l:target)
+  call s:ThinkParkCursor()
+endfunction
+
+" Applies the flushed lines to the panel buffer.  Only called with the
+" buffer temporarily modifiable (s:ThinkBufWrite); s:think_lines is the
+" buffer's current line count.
+function! s:ThinkApplyTarget(target, extend, placeholder)
+  if a:extend
+    " extend the in-flight last line, then append the rest
+    call setbufline(s:think_buf, s:think_lines, a:target[0])
+    if len(a:target) > 1
+      call appendbufline(s:think_buf, s:think_lines, a:target[1:])
     endif
-    let l:old = getbufline(s:think_buf, 1, '$')
-    if l:render != l:old
-      call s:ThinkBufWrite({ -> s:ThinkBufSync(l:render) })
-      let l:win = bufwinid(s:think_buf)
-      if l:win > 0
-        let l:here = win_getid()
-        call win_gotoid(l:win)
-        call cursor(len(l:render), 1)
-        call win_gotoid(l:here)
-      endif
+  elseif a:placeholder
+    " replace the placeholder blank line
+    call setbufline(s:think_buf, 1, a:target[0])
+    if len(a:target) > 1
+      call appendbufline(s:think_buf, 1, a:target[1:])
     endif
+  else
+    " the last line is complete: append everything as new lines
+    call appendbufline(s:think_buf, s:think_lines, a:target)
+  endif
+endfunction
+
+" Parks the panel's cursor on its last line, so while the model is still
+" thinking the panel auto-scrolls to the newest line; once the stream
+" settles the user is free to scroll back up (the buffer is nomodifiable,
+" so browsing can't clobber the content).  A win_gotoid hop: this build's
+" cursor() has no {win} argument (cursor(w, n) silently acts on the CURRENT
+" window), and redraw is deferred until the hop returns, so it never steals
+" focus from the user's active window.
+function! s:ThinkParkCursor()
+  if s:think_buf < 0
+    return
+  endif
+  let l:win = bufwinid(s:think_buf)
+  if l:win > 0
+    let l:here = win_getid()
+    call win_gotoid(l:win)
+    call cursor(max([1, s:think_lines]), 1)
+    call win_gotoid(l:here)
   endif
 endfunction
 
@@ -967,6 +1128,12 @@ function! s:ThinkCloseAll()
   endif
   let s:think_buf = -1
   let s:think_text = ''
+  let s:think_frag = ''
+  let s:think_lines = 0
+  let s:think_synced = 0
+  let s:think_pending = []
+  let s:think_synced_text = ''
+  let s:think_dirty = 0
 endfunction
 
 " ------------------- markdown highlighting (in-place, buffer-local) ---------
@@ -1051,11 +1218,11 @@ function! s:PiThinking()
   if l:cwin > 0
     call win_gotoid(l:cwin)
   endif
-  " render any thinking that accumulated before the panel existed (the flush
-  " parks the cursor too), then always park at the bottom so the next delta
-  " is followed; via win_gotoid hops since this build's cursor() has no
+  " render any thinking that accumulated before the panel existed (the
+  " render parks the cursor too), then always park at the bottom so the next
+  " delta is followed; via win_gotoid hops since this build's cursor() has no
   " {win} form
-  call s:FlushThinkTail()
+  call s:ThinkRenderFull()
   let l:win = bufwinid(s:think_buf)
   if l:win > 0
     let l:here = win_getid()
@@ -1682,7 +1849,13 @@ function! s:StartJob()
       let l:think = s:LoadSessionThinking(s:session_id)
       if !empty(l:think)
         let s:think_text = join(l:think, "\n") . "\n"
-        call s:FlushThinkTail()
+        let s:think_frag = ''
+        let s:think_lines = 0
+        let s:think_synced = 0
+        let s:think_pending = []
+        let s:think_synced_text = s:think_text
+        let s:think_dirty = 0
+        call s:ThinkRenderFull()
       endif
     endif
     call s:SetLine(s:NLines() + 1, '❯ ')
@@ -2531,6 +2704,11 @@ function! s:DrainQueue()
     call s:HandleEvent(l:msg)
   endfor
 
+  " Flush the thinking panel once per tick: the deltas were only
+  " accumulated during the pass above, so this is one buffer write no
+  " matter how many deltas arrived.
+  call s:ThinkFlush()
+
   if l:sticky
     call s:StickToInput()
   endif
@@ -2625,16 +2803,21 @@ function! s:AddLogLines(lines)
   if empty(l:clean)
     return
   endif
+  " Keep s:transcript in sync with the buffer edit above instead of a full
+  " re-capture: the lines land after buffer line l:at (the line above the
+  " streaming tail, or the last transcript line), so splice the list in
+  " place - O(tail region), not O(n).
   let l:n = len(l:clean)
   if s:tail_line > 0
     call s:AppendLines(s:tail_line - 1, l:clean)
     let s:input_line += l:n
     let s:tail_line += l:n
+    call extend(s:transcript, l:clean, l:at)
   else
     call s:AppendLines(s:input_line - 1, l:clean)
     let s:input_line += l:n
+    let s:transcript += l:clean
   endif
-  call s:CaptureTranscript()
 endfunction
 
 " --------------------------------- streaming --------------------------------
@@ -2643,7 +2826,7 @@ function! s:FlushTail()
   if s:tail ==# ''
     if s:tail_line > 0
       call s:SetLine(s:tail_line, '')
-      call s:CaptureTranscript()
+      let s:transcript[s:tail_line - 1] = ''
     endif
     return
   endif
@@ -2662,12 +2845,16 @@ function! s:FlushTail()
   endif
   let s:tail = l:pos
   if s:tail_line > 0
+    " AddLogLines above already spliced the transcript; the tail line itself
+    " now holds s:tail.
     call s:SetLine(s:tail_line, s:tail)
+    let s:transcript[s:tail_line - 1] = s:tail
   else
+    " AddLogLines appends s:tail's line to the transcript; it becomes the new
+    " streaming tail line.
     call s:AddLogLines([s:tail])
     let s:tail_line = s:input_line - 1
   endif
-  call s:CaptureTranscript()
 endfunction
 
 function! s:CommitTail()
@@ -2688,7 +2875,7 @@ function! s:CommitTail()
       if l:had_line > 1 && s:Line(l:had_line - 1) ==# ''
         call s:DeleteLines(l:had_line, l:had_line)
         let s:input_line -= 1
-        call s:CaptureTranscript()
+        call remove(s:transcript, l:had_line - 1)
       endif
       return
     endif
@@ -2900,9 +3087,9 @@ function! s:HandleDelta(msg)
     endif
     " the panel accumulates the stream even while hidden - or before it was
     " ever opened (s:think_buf == -1) - so opening it later still shows past
-    " thoughts; s:FlushThinkTail is a no-op until the buffer exists
-    let s:think_text .= get(l:evt, 'delta', '')
-    call s:FlushThinkTail()
+    " thoughts; s:ThinkAppendDelta keeps only the virtual string until the
+    " buffer exists, then syncs incrementally (O(delta), not O(panel))
+    call s:ThinkAppendDelta(get(l:evt, 'delta', ''))
   endif
 endfunction
 
