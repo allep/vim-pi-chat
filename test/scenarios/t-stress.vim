@@ -1,7 +1,7 @@
 " vim: set ft=vim ts=2 sw=2 sts=2 et:
 " Scenario: stress - a huge thinking stream through the :PiThinking panel.
-" Runner env: FAKE_PI_THINKING=1 with FAKE_PI_THINKING_TEXT set to ~3000
-" lines (~72k one-char thinking_delta frames).  Pre-fix, every delta forced
+" Runner env: FAKE_PI_THINKING=1 with FAKE_PI_THINKING_FILE holding ~1000
+" lines (~49k one-char thinking_delta frames).  Pre-fix, every delta forced
 " a full panel re-sync (getbufline+compare+setbufline of the whole buffer)
 " => O(n^2) work that takes minutes, so this run would still be draining
 " when it ends.  Post-fix the panel sync is incremental and the stream
@@ -25,7 +25,7 @@ function! s:Sample()
   let s:i += 1
   let l:pb = bufnr('__PiChatThinking__')
   let l:cb = bufnr('__PiChat__')
-  let l:relms = float2nr(reltimefloat(s:t0) * 1000)
+  let l:relms = float2nr(reltimefloat(reltime(s:t0)) * 1000)
   let l:tn = (l:pb > 0 && bufloaded(l:pb)) ? len(getbufline(l:pb, 1, '$')) : -1
   let l:cn = l:cb > 0 ? len(getbufline(l:cb, 1, '$')) : -1
   call add(s:out, 'S' . s:i . ' rel=' . l:relms . 'ms think=' . l:tn . ' chat=' . l:cn

@@ -385,8 +385,10 @@ function! s:WithChatWin(fn)
     return a:fn()
   endif
   let l:here = win_getid()
+  " noautocmd: win_gotoid fires BufLeave/WinEnter/BufEnter, so without it
+  " every hop runs the user's (and our own) Buf/WinEnter autocmds twice.
   try
-    call win_gotoid(l:win)
+    noautocmd call win_gotoid(l:win)
   catch
     " Chat window vanished mid-tick; degrade to running in the current window.
     return a:fn()
@@ -399,7 +401,7 @@ function! s:WithChatWin(fn)
       call cursor(l:n, s:InputCol(l:n))
     endif
     try
-      call win_gotoid(l:here)
+      noautocmd call win_gotoid(l:here)
     catch
     endtry
   endtry
@@ -662,7 +664,30 @@ endfunction
 
 function! s:SetStatus(text)
   if s:buf > 0 && buflisted(s:buf)
-    let b:pi_status = a:text
+    " setbufvar, not b:pi_status: the drain timer may run with any window
+    " current, and a `let b:` would label the user's file buffer instead.
+    call setbufvar(s:buf, 'pi_status', a:text)
+    " Repaint here, not only from the spinner: the spinner stops at turn end,
+    " so the final 'pi chat' would otherwise stay unpainted (the last spinner
+    " frame lingers) until the next keystroke forces a redraw.
+    call s:RedrawChatStatus()
+  endif
+endfunction
+
+" Repaint the chat window's status line if it is on screen.  Plain
+" redrawstatus only repaints the CURRENT window's status line, and timer
+" ticks often run with another window current (the drain timer does not hop
+" for spinner-only ticks), so use redrawstatus! there.  A hidden (parked)
+" chat has nothing to repaint.
+function! s:RedrawChatStatus()
+  let l:win = s:FindWin()
+  if l:win < 1
+    return
+  endif
+  if win_getid() == l:win
+    silent! redrawstatus
+  else
+    silent! redrawstatus!
   endif
 endfunction
 
@@ -695,8 +720,8 @@ endfunction
 
 function! s:SetModelLabel(label)
   let s:model_label = a:label
-  if s:buf > 0 && buflisted(s:buf) && s:FindWin() > 0
-    silent! redrawstatus
+  if s:buf > 0 && buflisted(s:buf)
+    call s:RedrawChatStatus()
   endif
 endfunction
 
@@ -756,15 +781,11 @@ function! s:SpinnerUpdate()
     let l:text .= '  (long run: :PiClose to stop)'
     if !s:run_timeout_fired
       let s:run_timeout_fired = 1
-      call s:AddLogLines(['', '⏱ pi run exceeded ' . g:pi_chat_run_timeout . 's - may be stuck; :PiClose to force-stop'])
+      call s:WithChatWin({ -> s:AddLogLines(['', '⏱ pi run exceeded '
+            \ . g:pi_chat_run_timeout . 's - may be stuck; :PiClose to force-stop']) })
     endif
   endif
   call s:SetStatus(l:text)
-  " The window may be hidden (agent parked); redrawstatus would act on the
-  " current window.
-  if s:buf > 0 && buflisted(s:buf) && s:FindWin() > 0
-    silent! redrawstatus
-  endif
 endfunction
 
 " --------------------------- working indicator -----------------------------
@@ -1093,9 +1114,9 @@ function! s:ThinkParkCursor()
   let l:win = bufwinid(s:think_buf)
   if l:win > 0
     let l:here = win_getid()
-    call win_gotoid(l:win)
+    noautocmd call win_gotoid(l:win)
     call cursor(max([1, s:think_lines]), 1)
-    call win_gotoid(l:here)
+    noautocmd call win_gotoid(l:here)
   endif
 endfunction
 
@@ -2655,6 +2676,13 @@ function! s:DrainTick(timer)
   if empty(s:queue) && !s:busy
     return
   endif
+  " A busy tick with nothing queued only advances the spinner, which edits
+  " no buffer text (status via setbufvar): skip the hop entirely, or a long
+  " turn spends its whole duration hopping windows 20 times a second.
+  if empty(s:queue)
+    call s:SpinnerTick()
+    return
+  endif
   " Run the entire tick with the chat window current (see s:WithChatWin): the
   " queued events and the spinner both edit the chat buffer by line number, so
   " they must not run while the user is in the thinking panel or elsewhere.
@@ -2663,6 +2691,10 @@ endfunction
 
 function! s:DrainTickBody()
   call s:DrainQueue()
+  call s:SpinnerTick()
+endfunction
+
+function! s:SpinnerTick()
   if s:busy
     let s:spin = (s:spin + 1) % len(s:spin_frames)
     call s:SpinnerUpdate()

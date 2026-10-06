@@ -210,23 +210,41 @@ and then acting"
               # failure strings (which the plain ': ok' min-two would not).
               check markdown 'PiMdHeading: ok' 'absent\|mismatch\|item-missing\|render-harness\|render-bold\|render-italic' ': ok' 'render-ok' '1' ;;
     stress)   export FAKE_PI_THINKING=1 FAKE_PI_TOOL=
-              # ~3000 thinking lines (~150KB) => ~150k one-char
+              # ~1000 thinking lines (~49KB) => ~49k one-char
               # thinking_delta frames.  Pre-fix (per-delta panel work) this is
               # minutes of O(n^2) work and the run never drains; post-fix the
-              # whole stream must drain within the 22s budget, so the panel
-              # head/tail and the echo reply must all be present when the
-              # dump is taken.
+              # drain is linear, ~8k frames/s on a slow CI runner (~6s), so the
+              # panel head/tail and the echo reply must all be present when the
+              # dump is taken.  Kept well under the 18.5s dump deadline: the
+              # rate is bound by per-frame json_decode, i.e. by machine speed.
               # Via a file, not FAKE_PI_THINKING_TEXT: Linux caps a single
               # env string at 128KB (MAX_ARG_STRLEN), and an oversized export
               # makes every later exec (rm, sleep, grep) fail with E2BIG.
-              seq 1 3000 | awk '{printf "reasoning step %04d with enough padding to matter\n", $1}' > /tmp/t-stress-think.txt
+              seq 1 1000 | awk '{printf "reasoning step %04d with enough padding to matter\n", $1}' > /tmp/t-stress-think.txt
               export FAKE_PI_THINKING_FILE=/tmp/t-stress-think.txt
               run stress 22
               check stress 'PANELHEAD ──── think about it' '' ''
-              check stress 'PANELTAIL reasoning step 3000' '' ''
+              check stress 'PANELTAIL reasoning step 1000' '' ''
               check stress 'CHATTAIL Echo: think about it' '' ''
-              check stress '^PANELCOUNT 3001$' '' '' '' '^PANELCOUNT 3001$'
+              check stress '^PANELCOUNT 1001$' '' '' '' '^PANELCOUNT 1001$'
               export FAKE_PI_THINKING_FILE= ;;
+    busyhop)  export FAKE_PI_DELAY_MS=8000 FAKE_PI_THINKING= FAKE_PI_TOOL=
+              run busyhop 6
+              # ~2.5s busy with nothing queued: zero autocmd firings (the old
+              # per-tick window hop fired ~100 of each), the spinner still
+              # advanced, and its status stayed on the chat buffer.
+              check busyhop '^HOPS 0 0 0$' '' ''
+              check busyhop '^SPIN 1$' '' ''
+              check busyhop '^FILESTATUS $' '' ''
+              check busyhop '^CUR t-busyhop-file\.txt$' '' ''
+              export FAKE_PI_DELAY_MS= ;;
+    settlestatus) export FAKE_PI_DELAY_MS=1500 FAKE_PI_THINKING= FAKE_PI_TOOL=
+              run settlestatus 7
+              # turn settled ~2s before the dump, no keystroke since: the
+              # painted status line must say 'pi chat', not a spinner frame.
+              check settlestatus '^VAR pi chat$' '' ''
+              check settlestatus '^SCREEN ?pi chat ' 'working|contacting' ''
+              export FAKE_PI_DELAY_MS= ;;
     working)  export FAKE_PI_DELAY_MS=2500 FAKE_PI_TURN_MS=100 FAKE_PI_THINKING= FAKE_PI_TOOL=
               run working 7
               # in flight: working line shown, reply not yet; after settle: reply in, working gone.
