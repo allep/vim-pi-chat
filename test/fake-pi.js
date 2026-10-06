@@ -9,6 +9,8 @@
 // For each `prompt` it emits a canned reply plus (env-controlled) a thinking
 // block and/or tool executions, so the test suite can exercise the handlers:
 //   FAKE_PI_THINKING=1     emit thinking_delta frames before the reply
+//   FAKE_PI_THINKING_FILE=f  read the thinking text from file f (overrides
+//                          FAKE_PI_THINKING_TEXT; for streams >128KB)
 //   FAKE_PI_TOOL=bash      which tool to run: bash|read|edit|write|multi|none
 //                          (default bash; 'multi' runs bash+read+edit)
 //   FAKE_PI_EDIT_PATH=p    args.path for an edit/write tool (reload target)
@@ -110,7 +112,12 @@ function handle(req, dequeued) {
         const turn  = parseInt(process.env.FAKE_PI_TURN_MS  || '150', 10);
         const tool  = process.env.FAKE_PI_TOOL || 'bash';
         const think = process.env.FAKE_PI_THINKING === '1';
-        const thinkText = process.env.FAKE_PI_THINKING_TEXT || 'Thinking: weighing the options';
+        // FAKE_PI_THINKING_FILE: read the thinking text from a file (for huge
+        // streams: Linux caps a single env string at 128KB, MAX_ARG_STRLEN).
+        let thinkText = process.env.FAKE_PI_THINKING_TEXT || 'Thinking: weighing the options';
+        if (process.env.FAKE_PI_THINKING_FILE) {
+          try { thinkText = require('fs').readFileSync(process.env.FAKE_PI_THINKING_FILE, 'utf8'); } catch {}
+        }
         const title = process.env.FAKE_PI_TITLE || 'pi';
         const prefix= process.env.FAKE_PI_REPLY_PREFIX || 'Echo: ';
         const editPath = process.env.FAKE_PI_EDIT_PATH || 'ctx.txt';

@@ -228,13 +228,17 @@ and then acting"
               # whole stream must drain within the 22s budget, so the panel
               # head/tail and the echo reply must all be present when the
               # dump is taken.
-              export FAKE_PI_THINKING_TEXT="$(seq 1 3000 | awk '{printf "reasoning step %04d with enough padding to matter\n", $1}')"
+              # Via a file, not FAKE_PI_THINKING_TEXT: Linux caps a single
+              # env string at 128KB (MAX_ARG_STRLEN), and an oversized export
+              # makes every later exec (rm, sleep, grep) fail with E2BIG.
+              seq 1 3000 | awk '{printf "reasoning step %04d with enough padding to matter\n", $1}' > /tmp/t-stress-think.txt
+              export FAKE_PI_THINKING_FILE=/tmp/t-stress-think.txt
               run stress 22
               check stress 'PANELHEAD ──── think about it' '' ''
               check stress 'PANELTAIL reasoning step 3000' '' ''
               check stress 'CHATTAIL Echo: think about it' '' ''
               check stress '^PANELCOUNT 3001$' '' '' '' '^PANELCOUNT 3001$'
-              export FAKE_PI_THINKING_TEXT= ;;
+              export FAKE_PI_THINKING_FILE= ;;
     working)  export FAKE_PI_DELAY_MS=2500 FAKE_PI_TURN_MS=100 FAKE_PI_THINKING= FAKE_PI_TOOL=
               run working 7
               # in flight: working line shown, reply not yet; after settle: reply in, working gone.
